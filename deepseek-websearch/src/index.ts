@@ -10,12 +10,18 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { resolve } from 'path';
 import { pathToFileURL } from 'url';
-import { loadEnvFile, makeLogger, makeToolError, redactSensitive } from 'mcp-common';
+import { loadEnvFile } from './env.js';
+import { makeLogger } from './logging.js';
+import { makeToolError } from './errors.js';
+import { redactSensitive } from './redact.js';
 import { readResearchConfig, runResearch } from './research.js';
 export * from './research.js';
 export { redactSensitive };
+export { parseEnvValue, loadEnvFile } from './env.js';
+export { makeToolError } from './errors.js';
+export { makeLogger } from './logging.js';
 
-// .env 约定：启动时只加载一次（mcp-common 单一实现）。
+// .env 约定：启动时只加载一次。
 loadEnvFile();
 
 const API_KEY = process.env.TAVILY_API_KEY;
@@ -23,7 +29,7 @@ const IS_KEYLESS = !API_KEY;
 const HUMAN_ID = process.env.TAVILY_HUMAN_ID;
 const SESSION_ID = randomUUID();
 
-// ---- 静默日志 + 错误前缀（工作区约定，mcp-common 单一实现）----
+// ---- 静默日志 + 错误前缀 ----
 const log = makeLogger('deepseek-websearch', 'DEEPSEEK_WEBSEARCH_LOG_LEVEL');
 export const toolError = makeToolError('deepseek-websearch');
 

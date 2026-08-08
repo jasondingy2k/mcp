@@ -1,4 +1,4 @@
-// logging.ts — 默认静默日志（工作区约定）：仅当 envVar 设置合法级别时输出到 stderr。
+// logging.ts — 默认静默日志：仅当 envVar 设置合法级别时输出到 stderr。
 // 诊断信息应进工具返回文本，不累积日志文件。非法级别（如 verbose）视为未配置 → 静默。
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 const LOG_LEVELS: LogLevel[] = ['debug', 'info', 'warn', 'error'];

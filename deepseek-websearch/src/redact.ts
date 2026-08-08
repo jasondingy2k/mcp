@@ -1,4 +1,4 @@
-// redact.ts — 敏感信息脱敏（工作区约定，单一实现；mcp-common 共享）。
+// redact.ts — 敏感信息脱敏。
 // 顺序关键：先吃掉完整 `Authorization: Bearer <token>` / `Bearer <token>`，
 // 再处理 api_key=…；切勿用 authorization[=:] 只吃到 "Bearer" 而留下 tvly-… 真值。
 export function redactSensitive(text: string): string {

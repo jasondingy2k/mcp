@@ -8,7 +8,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import OpenAI from 'openai';
 import { readFile, unlink } from 'fs/promises';
-import { makeLogger, makeToolError } from 'mcp-common';
+import { makeLogger } from './logging.js';
+import { makeToolError } from './errors.js';
 import {
   apiKey,
   baseUrl,
@@ -35,7 +36,7 @@ const KEYLESS_GUIDANCE =
   '1. Open https://opencode.ai/auth and copy an API Key\n' +
   '2. Set OPENCODE_API_KEY in the env of this MCP server (CC Switch).';
 
-// ---- 工作区约定（mcp-common 单一实现）----
+// ---- 静默日志 + 错误前缀 ----
 export const toolError = makeToolError('deepseek-vision');
 export const log = makeLogger('deepseek-vision', 'DEEPSEEK_VISION_LOG_LEVEL');
 

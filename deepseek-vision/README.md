@@ -18,11 +18,9 @@
 
 ## 构建与运行
 
-要求 Node 20+；macOS 剪贴板读图依赖 `pngpaste`（`brew install pngpaste`）；Windows 用系统自带 `powershell.exe`；Linux 未支持，请用 `source=path`。依赖共享包 `mcp-common`（工作区约定单一实现），需先构建：
+要求 Node 20+；macOS 剪贴板读图依赖 `pngpaste`（`brew install pngpaste`）；Windows 用系统自带 `powershell.exe`；Linux 未支持，请用 `source=path`。
 
 ```bash
-cd ../mcp-common && npm install && npm run build
-cd ../deepseek-vision
 npm install
 npm run build
 node build/index.js        # stdio 传输，接入 CC Switch / Claude Code 等 MCP 客户端
@@ -83,7 +81,7 @@ node build/index.js        # stdio 传输，接入 CC Switch / Claude Code 等 M
 - [x] 对照清单零成本回归（工具名/schema/PROMPTS/env 名/错误前缀，逐项比对）
 - [x] 真实 API smoke（2026-08-07：B1.1–B1.8 全过）
 - [x] 剪贴板方案 A（2026-08-07）：darwin `pngpaste` + win32 `powershell.exe`；Linux 明确暂不支持；45 单测；macOS 真机 smoke（截图→读图→校验链）通过
-- [x] P2/P3 收口（2026-08-08）：剪贴板超时阶段标注、未知工具前缀、mcp-common `.env` 引号内 `#`、MIME 魔数、README/`VISION_MAX_IMAGE_PIXELS` 等
+- [x] P2/P3 收口（2026-08-08）：剪贴板超时阶段标注、未知工具前缀、`.env` 引号内 `#`、MIME 魔数、README/`VISION_MAX_IMAGE_PIXELS` 等
 
 ## License
 

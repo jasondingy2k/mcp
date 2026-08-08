@@ -16,11 +16,9 @@ fork 自 [tavily-ai/tavily-mcp](https://github.com/tavily-ai/tavily-mcp) v0.2.22
 
 ## 构建与运行
 
-要求 Node 20+。依赖共享包 `mcp-common`（工作区约定单一实现），需先构建：
+要求 Node 20+：
 
 ```bash
-cd ../mcp-common && npm install && npm run build
-cd ../deepseek-websearch
 npm install
 npm run build
 node build/index.js        # stdio 传输，接入 CC Switch / Claude Code 等 MCP 客户端

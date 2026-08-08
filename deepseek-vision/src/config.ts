@@ -1,5 +1,5 @@
-// config.ts — 环境变量读取（.env 加载统一走 mcp-common 的 loadEnvFile）
-import { loadEnvFile } from 'mcp-common';
+// config.ts — 环境变量读取（.env 启动时只加载一次）
+import { loadEnvFile } from './env.js';
 
 export const DEFAULT_BASE_URL = 'https://opencode.ai/zen/go/v1';
 export const DEFAULT_MODEL = 'mimo-v2.5';

@@ -13,7 +13,6 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
-    "mcp-common": "file:../mcp-common",
     "openai": "^7.4.0",
     "sharp": "^0.35.3"
   },

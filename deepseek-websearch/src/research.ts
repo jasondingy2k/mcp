@@ -2,7 +2,7 @@
 // 阶段 3：广度规划（LLM#1）+ 并行执行（evidence 双轨）+ 深度规划（LLM#2）+ 串行渐进执行。
 // 综合报告在阶段 4。零运行生成物：全程内存传递，不落盘、不缓存。日志由 index.ts 的 log 处理。
 // LLM 调用用 node 20+ 内置 fetch + AbortController，零新增依赖。
-import { redactSensitive } from 'mcp-common';
+import { redactSensitive } from './redact.js';
 
 // ---- 配置类型与读取（方案 §5）----
 export interface ResearchConfig {
@@ -89,7 +89,7 @@ export interface ChatResult {
   usage: ChatUsage | null; // OpenAI 兼容 usage（诊断总窗余量；上游未返回则 null）
 }
 
-/** 单次 chat completion；重试由调用方控制（不内置重试）。错误体脱敏（mcp-common redactSensitive）。 */
+/** 单次 chat completion；重试由调用方控制（不内置重试）。错误体脱敏（redactSensitive）。 */
 export async function chatCompletion(opts: ChatOpts): Promise<ChatResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs);

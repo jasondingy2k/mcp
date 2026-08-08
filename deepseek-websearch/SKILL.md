@@ -29,7 +29,7 @@ description: "deepseek-websearch 工具名映射记录：官方 tavily-mcp v0.2.
    - 错误前缀 `[deepseek-websearch 内部错误]`；
    - 搜索失败切换（Tavily→Exa，401/403 不切换）；
    - crawl 双模式（job_id 轮询 + 直接结果）、research 三层护栏（退避 1.5 轮询 + 透明切流 + 多层超时）；
-   - 阶段标注（`（卡在 xx）`）、静默日志 + 最新错误日志（mcp-common）；
+   - 阶段标注（`（卡在 xx）`）、静默日志 + 错误脱敏；
 4. 回归：`npm run build && node --test`，再按 `测试素材/websearch/用例清单.md` 做真实 API 回归。
 
 ## 注意
