@@ -60,6 +60,8 @@ export const toolError = makeToolError('deepseek-websearch');
 // ---- Tavily→Exa search 池化（多 key 加权负载均衡方案 2026-08-08 §5）----
 const SEARCH_PROVIDER_TIMEOUT_MS = 30000;       // per-provider HTTP budget
 const SEARCH_FAILOVER_TOTAL_TIMEOUT_MS = 60000; // total Tavily→Exa sequence budget
+const SEARCH_TRANSIENT_RETRIES = 1;             // 同 key 5xx 再试次数（Exa 借鉴方案 §2 F）
+const SEARCH_TRANSIENT_BASE_DELAY_MS = 500;
 const EXTRACT_TIMEOUT_MS = 120000;              // extract: minute-level budget (multi-URL)
 const MAP_TIMEOUT_MS = 30000;                   // map: seconds-level budget
 const CRAWL_SUBMIT_TIMEOUT_MS = 60000;          // crawl: POST /crawl submit budget
@@ -135,14 +137,35 @@ export function validateSearchPayload(data: any, provider: string): void {
   // 混合条目（合法对象 + null）在校验层不抛；渲染层必须 skip 非对象，避免 TypeError
 }
 
+/** Exa category: 从 query 解析 `category:people` 等（对齐官方 MCP，不扩 schema）。 */
+const EXA_CATEGORY_RE =
+  /\bcategory:(company|publication|news|pdf|github|personal\s*site|people|financial report)\b/i;
+
+export function parseExaCategory(query: string): { query: string; category?: string } {
+  const m = query.match(EXA_CATEGORY_RE);
+  if (!m) return { query };
+  const category = m[1].toLowerCase().replace(/\s+/g, ' ');
+  const cleaned = query.replace(m[0], '').replace(/\s+/g, ' ').trim();
+  return { query: cleaned || query.trim(), category };
+}
+
+/** Exa 单条结果正文上限（API text.maxCharacters + 映射层双保险）。 */
+export const EXA_CONTENT_MAX_CHARS = 1200;
+
 // Map the search params that Exa understands; the rest are ignored.
+// 轻量：显式 text 封顶 + highlights 封顶；禁止只开 highlights:true（实测仍可能带回全文 text）。
 export function buildExaPayload(params: any): Record<string, any> {
+  const { query, category } = parseExaCategory(String(params.query ?? ''));
   const payload: Record<string, any> = {
-    query: params.query,
+    query,
     numResults: typeof params.max_results === 'number' ? params.max_results : 5,
     type: 'auto',
-    contents: { text: { maxCharacters: 1200 } },
+    contents: {
+      text: { maxCharacters: EXA_CONTENT_MAX_CHARS },
+      highlights: { maxCharacters: EXA_CONTENT_MAX_CHARS },
+    },
   };
+  if (category) payload.category = category;
   if (Array.isArray(params.include_domains) && params.include_domains.length > 0) {
     payload.includeDomains = params.include_domains;
   }
@@ -154,26 +177,161 @@ export function buildExaPayload(params: any): Record<string, any> {
   return payload;
 }
 
+function clampExaContent(text: string, max: number = EXA_CONTENT_MAX_CHARS): string {
+  if (!text || text.length <= max) return text;
+  return text.slice(0, max) + '…';
+}
+
 // Map an Exa payload onto the TavilyResponse shape so the existing
-// formatResults() renders it unchanged.
+// formatResults() renders it unchanged. Prefer highlights; always clamp.
 export function mapExaResultsToTavily(data: any): TavilyResponse {
   const raw = Array.isArray(data.results) ? data.results : [];
   const results = raw
     .filter((item: any) => item && typeof item === 'object')
     .map((item: any) => {
-      let contents: string = item.text || item.summary || '';
-      if (Array.isArray(item.highlights)) {
+      let contents = '';
+      if (Array.isArray(item.highlights) && item.highlights.length > 0) {
         contents = item.highlights.join(' [...] ');
+      } else {
+        contents = item.text || item.summary || '';
       }
       return {
         title: String(item.title ?? ''),
         url: String(item.url ?? ''),
-        content: String(contents ?? ''),
+        content: clampExaContent(String(contents ?? '')),
         score: typeof item.score === 'number' ? item.score : 0,
         id: item.id ? String(item.id) : '',
       };
     });
   return { query: String(data.query ?? ''), results };
+}
+
+/** agent 常把 number/boolean 当 query、数字串当 max_results、单 URL 当 urls。 */
+export function coerceSearchArgs(args: any): any {
+  if (!args || typeof args !== 'object') return args;
+  const out: any = { ...args };
+  if (typeof out.query === 'number' || typeof out.query === 'boolean') {
+    out.query = String(out.query);
+  }
+  if (typeof out.query === 'string') out.query = out.query.trim();
+  if (typeof out.max_results === 'string' && /^\d+$/.test(out.max_results.trim())) {
+    out.max_results = Number(out.max_results.trim());
+  }
+  out.include_domains = coerceStringList(out.include_domains);
+  out.exclude_domains = coerceStringList(out.exclude_domains);
+  return out;
+}
+
+export function coerceExtractArgs(args: any): any {
+  if (!args || typeof args !== 'object') return args;
+  const out: any = { ...args };
+  out.urls = coerceUrlList(out.urls);
+  return out;
+}
+
+/**
+ * Tavily search 最优解默认（方案 2026-08-09）：
+ * - include_answer: "basic"（显式 false/0/"false" 可关）
+ * - chunks_per_source: 2（1–3；显式保留）
+ * 不设 auto_parameters。不覆盖调用方已传值。
+ */
+export function applySearchDefaults(params: any): any {
+  if (!params || typeof params !== 'object') return params;
+  const out: any = { ...params };
+
+  if (out.include_answer === undefined) {
+    out.include_answer = 'basic';
+  } else if (out.include_answer === false || out.include_answer === 0 || out.include_answer === 'false') {
+    out.include_answer = false;
+  } else if (out.include_answer === true || out.include_answer === 'true') {
+    out.include_answer = 'basic';
+  }
+  // "basic" | "advanced" | false 原样保留
+
+  if (out.chunks_per_source === undefined) {
+    out.chunks_per_source = 2;
+  } else if (typeof out.chunks_per_source === 'string' && /^\d+$/.test(out.chunks_per_source.trim())) {
+    out.chunks_per_source = Number(out.chunks_per_source.trim());
+  }
+  if (typeof out.chunks_per_source === 'number') {
+    out.chunks_per_source = Math.min(3, Math.max(1, Math.floor(out.chunks_per_source)));
+  }
+
+  return out;
+}
+
+/** extract：有 query 重排时默认 chunks_per_source=3（1–5）。 */
+export function applyExtractDefaults(params: any): any {
+  if (!params || typeof params !== 'object') return params;
+  const out: any = { ...params };
+  const hasQuery = typeof out.query === 'string' && out.query.trim().length > 0;
+  if (hasQuery && out.chunks_per_source === undefined) {
+    out.chunks_per_source = 3;
+  } else if (typeof out.chunks_per_source === 'string' && /^\d+$/.test(out.chunks_per_source.trim())) {
+    out.chunks_per_source = Number(out.chunks_per_source.trim());
+  }
+  if (typeof out.chunks_per_source === 'number') {
+    out.chunks_per_source = Math.min(5, Math.max(1, Math.floor(out.chunks_per_source)));
+  }
+  return out;
+}
+
+function coerceStringList(v: unknown): string[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (Array.isArray(v)) {
+    return v.map((x) => String(x).trim()).filter((s) => s.length > 0);
+  }
+  if (typeof v === 'string') {
+    return v.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  }
+  return undefined;
+}
+
+function coerceUrlList(v: unknown): string[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (Array.isArray(v)) {
+    return v.map((x) => String(x).trim()).filter((s) => s.length > 0);
+  }
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (!t) return [];
+    if (t.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(t);
+        if (Array.isArray(parsed)) {
+          return parsed.map((x) => String(x).trim()).filter((s) => s.length > 0);
+        }
+      } catch {
+        /* fall through: treat as single URL */
+      }
+    }
+    return [t];
+  }
+  return [String(v)];
+}
+
+/** 同 key 瞬态 5xx：最多再试 SEARCH_TRANSIENT_RETRIES 次，再失败交给换 key。 */
+export function isTransientHttpStatus(status: unknown): boolean {
+  return status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+export async function retryTransientHttp<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = SEARCH_TRANSIENT_RETRIES,
+  baseDelayMs: number = SEARCH_TRANSIENT_BASE_DELAY_MS,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const status = err?.response?.status;
+      if (!isTransientHttpStatus(status) || attempt === maxRetries) throw err;
+      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** attempt));
+    }
+  }
+  throw lastErr;
 }
 
 function bodyText(data: any): string {
@@ -234,6 +392,11 @@ interface TavilyResponse {
     favicon?: string;
     id: string;
   }>;
+  /** extract 部分 URL 失败时 Tavily 返回；search 通常无此字段 */
+  failed_results?: Array<{
+    url?: string;
+    error?: string;
+  } | string>;
 }
 
 interface TavilyCrawlResponse {
@@ -356,7 +519,7 @@ class TavilyClient {
       const tools: Tool[] = [
         {
           name: "deepseek_search",
-          description: "MUST use for live/time-sensitive web info. For specific URLs use deepseek_extract; for deep reports use deepseek_research.",
+          description: "MUST use for live web info. Prefer semantic page description over keywords; default basic depth (1 credit; advanced=2). URLs→deepseek_extract; deep reports→deepseek_research. Thin snippets→extract best URLs.",
           inputSchema: {
             type: "object",
             properties: {
@@ -367,8 +530,13 @@ class TavilyClient {
               search_depth: {
                 type: "string",
                 enum: ["basic","advanced","fast","ultra-fast"],
-                description: "basic / advanced / fast / ultra-fast",
+                description: "basic=1 credit (default); advanced=2 for precise facts",
                 default: "basic"
+              },
+              topic: {
+                type: "string",
+                enum: ["general", "news", "finance"],
+                description: "news/finance for time-sensitive; country forces general"
               },
               time_range: {
                 type: "string",
@@ -389,6 +557,15 @@ class TavilyClient {
                 default: 5,
                 minimum: 1,
                 maximum: 20
+              },
+              chunks_per_source: {
+                type: "number",
+                description: "Chunks per URL (1–3; default 2)",
+                minimum: 1,
+                maximum: 3
+              },
+              include_answer: {
+                description: "LLM answer from results (default basic; false to disable)"
               },
               include_raw_content: {
                 type: "boolean",
@@ -418,7 +595,7 @@ class TavilyClient {
         },
         {
           name: "deepseek_extract",
-          description: "Extract full page content from user-provided URLs. Do NOT use deepseek_search for URL extraction.",
+          description: "Extract full page content from URLs (batch OK). Use after search when snippets are thin. Do NOT use deepseek_search for URL extraction.",
           inputSchema: {
             type: "object",
             properties: {
@@ -442,6 +619,12 @@ class TavilyClient {
               query: {
                 type: "string",
                 description: "Rerank chunks by relevance"
+              },
+              chunks_per_source: {
+                type: "number",
+                description: "Chunks per URL when query set (1–5; default 3)",
+                minimum: 1,
+                maximum: 5
               }
             },
             required: ["urls"]
@@ -582,10 +765,11 @@ class TavilyClient {
     this.server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
       try {
         let response: TavilyResponse;
-        const args = request.params.arguments ?? {};
+        const rawArgs = request.params.arguments ?? {};
 
         switch (request.params.name) {
-          case "deepseek_search":
+          case "deepseek_search": {
+            const args = coerceSearchArgs(rawArgs);
             // If country is set, ensure topic is general
             if (args.country) {
               args.topic = "general";
@@ -597,6 +781,8 @@ class TavilyClient {
               topic: args.topic,
               time_range: args.time_range,
               max_results: args.max_results,
+              chunks_per_source: args.chunks_per_source,
+              include_answer: args.include_answer,
               include_images: args.include_images,
               include_image_descriptions: args.include_image_descriptions,
               include_raw_content: args.include_raw_content,
@@ -609,8 +795,10 @@ class TavilyClient {
               exact_match: args.exact_match
             });
             break;
+          }
           
-          case "deepseek_extract":
+          case "deepseek_extract": {
+            const args = applyExtractDefaults(coerceExtractArgs(rawArgs));
             response = await this.extract({
               urls: args.urls,
               extract_depth: args.extract_depth,
@@ -618,10 +806,13 @@ class TavilyClient {
               format: args.format,
               include_favicon: args.include_favicon,
               query: args.query,
+              chunks_per_source: args.chunks_per_source,
             });
             break;
+          }
 
-          case "deepseek_crawl":
+          case "deepseek_crawl": {
+            const args = rawArgs;
             const crawlResponse = await this.crawl({
               url: args.url,
               max_depth: args.max_depth,
@@ -642,8 +833,10 @@ class TavilyClient {
                 text: formatCrawlResults(crawlResponse)
               }]
             };
+          }
 
-          case "deepseek_map":
+          case "deepseek_map": {
+            const args = rawArgs;
             const mapResponse = await this.map({
               url: args.url,
               max_depth: args.max_depth,
@@ -660,16 +853,17 @@ class TavilyClient {
                 text: formatMapResults(mapResponse)
               }]
             };
+          }
 
           case "deepseek_research": {
-            if (typeof args.input !== 'string' || !args.input.trim()) {
+            if (typeof rawArgs.input !== 'string' || !rawArgs.input.trim()) {
               return {
                 content: [{ type: "text", text: toolError('ValidationError', 'input 必须为非空字符串') }],
                 isError: true,
               };
             }
             const researchRun = await runResearch({
-              task: args.input,
+              task: rawArgs.input,
               config: researchConfig,
               searchFn: (params: any) => this.search(params),
             });
@@ -762,12 +956,14 @@ class TavilyClient {
       const defaults = this.getDefaultParameters();
 
       // Prepare the request payload (official logic preserved)
-      const searchParams: any = {
+      let searchParams: any = {
         query: params.query,
         search_depth: params.search_depth,
         topic: params.topic,
         time_range: params.time_range,
         max_results: params.max_results,
+        chunks_per_source: params.chunks_per_source,
+        include_answer: params.include_answer,
         include_images: params.include_images,
         include_image_descriptions: params.include_image_descriptions,
         include_raw_content: params.include_raw_content,
@@ -788,6 +984,9 @@ class TavilyClient {
         }
       }
 
+      // 最优解默认：answer=basic、chunks=2（显式 / DEFAULT_PARAMETERS 已设则保留）
+      searchParams = applySearchDefaults(searchParams);
+
       // We have to set defaults due to the issue with optional parameter types or defaults = None
       // Because of this, we have to set the time_range to None if start_date or end_date is set
       // or else start_date and end_date will always cause errors when sent
@@ -800,11 +999,14 @@ class TavilyClient {
       for (const key in searchParams) {
         const value = searchParams[key];
         // Skip empty strings, null, undefined, and empty arrays
+        // include_answer: false 必须保留（否则又被 apply 成 basic）
         if (value !== "" && value !== null && value !== undefined &&
             !(Array.isArray(value) && value.length === 0)) {
           cleanedParams[key] = value;
         }
       }
+      // false 被上面跳过了——显式关闭 answer 时不要发给 API（等同 omit）
+      // 若需「无 answer」：omit 即可；cleaned 不含 false 正确。
 
       return this.searchWithKeyPool(cleanedParams);
   }
@@ -843,11 +1045,13 @@ class TavilyClient {
       // ---- 无任何池：现网 keyless 行为（Tavily keyless，不建池）----
       if (SEARCH_CANDIDATES.length === 0) {
         try {
-          const response = await this.axiosInstance.post(this.baseURLs.search, payload, {
-            headers: this.tavilyHeaders(undefined),
-            timeout: SEARCH_PROVIDER_TIMEOUT_MS,
-            signal: controller.signal,
-          });
+          const response = await retryTransientHttp(() =>
+            this.axiosInstance.post(this.baseURLs.search, payload, {
+              headers: this.tavilyHeaders(undefined),
+              timeout: SEARCH_PROVIDER_TIMEOUT_MS,
+              signal: controller.signal,
+            })
+          );
           raiseForStatus('Tavily', response.status, bodyText(response.data));
           validateSearchPayload(response.data, 'Tavily');
           return response.data;
@@ -866,30 +1070,34 @@ class TavilyClient {
             const providerLabel = cand.provider === 'tavily' ? 'Tavily' : 'Exa';
             try {
               if (cand.provider === 'tavily') {
-                const response = await this.axiosInstance.post(this.baseURLs.search, {
-                  ...payload,
-                  api_key: cand.key,
-                }, {
-                  headers: this.tavilyHeaders(cand.key),
-                  timeout: SEARCH_PROVIDER_TIMEOUT_MS,
-                  signal: controller.signal,
-                });
+                const response = await retryTransientHttp(() =>
+                  this.axiosInstance.post(this.baseURLs.search, {
+                    ...payload,
+                    api_key: cand.key,
+                  }, {
+                    headers: this.tavilyHeaders(cand.key),
+                    timeout: SEARCH_PROVIDER_TIMEOUT_MS,
+                    signal: controller.signal,
+                  })
+                );
                 raiseForStatus('Tavily', response.status, bodyText(response.data));
                 validateSearchPayload(response.data, 'Tavily');
                 return { provider: 'tavily' as const, data: response.data };
               }
-              const response = await axios.post(
-                'https://api.exa.ai/search',
-                buildExaPayload(payload),
-                {
-                  headers: {
-                    'x-api-key': cand.key,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                  },
-                  timeout: SEARCH_PROVIDER_TIMEOUT_MS,
-                  signal: controller.signal,
-                }
+              const response = await retryTransientHttp(() =>
+                axios.post(
+                  'https://api.exa.ai/search',
+                  buildExaPayload(payload),
+                  {
+                    headers: {
+                      'x-api-key': cand.key,
+                      'Content-Type': 'application/json',
+                      'Accept': 'application/json',
+                    },
+                    timeout: SEARCH_PROVIDER_TIMEOUT_MS,
+                    signal: controller.signal,
+                  }
+                )
               );
               raiseForStatus('Exa', response.status, bodyText(response.data));
               validateSearchPayload(response.data, 'Exa');
@@ -1134,6 +1342,22 @@ export function formatResults(response: TavilyResponse): string {
     });
   }
 
+  // extract 部分 URL 失败：成功页照常输出，失败列表单独可读（Exa 借鉴方案 §2 C）
+  const failed = Array.isArray(response.failed_results) ? response.failed_results : [];
+  if (failed.length > 0) {
+    output.push('\nFailed URLs:');
+    failed.forEach((item, index) => {
+      if (typeof item === 'string') {
+        output.push(`[${index + 1}] ${item}`);
+        return;
+      }
+      if (!item || typeof item !== 'object') return;
+      const url = item.url ?? '';
+      const err = item.error ?? 'unknown error';
+      output.push(`[${index + 1}] ${url}: ${err}`);
+    });
+  }
+
   return output.join('\n');
 }
 
@@ -1191,11 +1415,11 @@ function listTools(): void {
   const tools = [
     {
       name: "deepseek_search",
-      description: "MUST use for live/time-sensitive web info. For specific URLs use deepseek_extract; for deep reports use deepseek_research."
+      description: "MUST use for live web info. Prefer semantic page description over keywords; default basic depth (1 credit; advanced=2). URLs→deepseek_extract; deep reports→deepseek_research. Thin snippets→extract best URLs."
     },
     {
       name: "deepseek_extract",
-      description: "Extract full page content from user-provided URLs. Do NOT use deepseek_search for URL extraction."
+      description: "Extract full page content from URLs (batch OK). Use after search when snippets are thin. Do NOT use deepseek_search for URL extraction."
     },
     {
       name: "deepseek_crawl",

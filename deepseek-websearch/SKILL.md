@@ -33,9 +33,10 @@ Use the **`deepseek-websearch` MCP** tools when:
 ## How
 
 1. Pick the matching tool above; `deepseek_search` is the default for any live-info query.
-2. Cite returned URLs in your answer.
-3. Provider order is automatic: **Tavily first**; **Exa** only on Tavily non-auth failure (5xx/timeout). 401/403 auth failures never fall back.
-4. Never answer time-sensitive queries from memory.
+2. Prefer **semantic queries** (describe the ideal page), not bare keywords. Prefer `search_depth=basic` (1 credit); use `advanced` only for precise facts (2 credits). If snippets are thin, call `deepseek_extract` on the best URLs.
+3. Cite returned URLs in your answer.
+4. Search keys are selected by **weighted round-robin** across Tavily/Exa pools (multi-key); failures retry other keys in-pool. extract/crawl/map use Tavily only.
+5. Never answer time-sensitive queries from memory.
 
 ## Environment rules installation
 

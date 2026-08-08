@@ -73,7 +73,9 @@ ln -sfn /Users/jason/mcp/deepseek-websearch ~/.cc-switch/skills/deepseek-websear
 - [x] extract/map 超时护栏（120s / 30s）；crawl 建任务+轮询（退避 1.5 / 5 分钟预算 / 阶段标注）
 - [x] 真实 API smoke test（2026-08-07：A1.1–A1.8 全过；A1.3 Exa 回退为单测覆盖，活体触发需 quota/5xx）
 - [x] research 主代理改造（2026-08-08）：先广后深编排替代官方 `/research`；5–10 点封顶 + 3 次模型；70 单测；`RESEARCH_*` 配置；6 轮真实 smoke 收敛（综合删 `max_tokens` 帽 + 深度规划输入瘦身首 300 字，见设计文档 §11）
-- [x] 多 key 加权负载均衡（2026-08-08）：Tavily/Exa key 逗号多 key + WRR 选 key（默认 1000/1400，env 可覆盖）；search 成功路径按权重选引擎；单次请求失败换池内下一 key；extract/crawl/map 仅 Tavily 池；`shouldFallbackToExa` → `shouldRetryNextKey`（全 kind 换 key）；83 单测
+- [x] 多 key 加权负载均衡（2026-08-08）：Tavily/Exa key 逗号多 key + WRR 选 key（默认 1000/1400，env 可覆盖）；search 成功路径按权重选引擎；单次请求失败换池内下一 key；extract/crawl/map 仅 Tavily 池；`shouldFallbackToExa` → `shouldRetryNextKey`（全 kind 换 key）
+- [x] Exa 官方 MCP 可借鉴改进（2026-08-09）：语义查询描述引导；Exa highlights；extract `failed_results`；入参 coerce；query 内 `category:`；search 同 key 5xx 再试 1 次
+- [x] 最优解自研×Tavily×Exa（2026-08-09）：Tavily 默认 answer=basic + chunks=2；可选 topic；research 子搜无 answer；不默认 auto_parameters
 
 ## License
 

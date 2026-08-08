@@ -27,6 +27,7 @@ export const RESEARCH_PLAN_TIMEOUT_MS = 60000;          // 规划单次超时
 export const RESEARCH_PLAN_MAX_ATTEMPTS = 2;            // 规划 JSON 解析失败重试 1 次
 export const RESEARCH_SYNTHESIS_TIMEOUT_MS = 120000;    // 综合超时
 export const RESEARCH_BREADTH_MAX_RESULTS = 4;          // 广度/深度子 search 默认 max_results（§6：3~5）
+export const RESEARCH_CHUNKS_PER_SOURCE = 2;            // 子搜轻量 chunks（最优解方案 2026-08-09）
 export const RESEARCH_DEPTH_BRIEF_HEAD_CHARS = 300;     // 深度规划每条 brief 只取 title+url+首段摘要，不喂全文（防输入挤崩输出）
 
 /** 正整数解析；非法/空/负数回退 fallback（与 .env 约定一致，不抛错）。 */
@@ -269,7 +270,14 @@ export interface BreadthOutcome { briefs: BriefResult[]; evidence: EvidenceItem[
 
 export interface RunBreadthOpts {
   plan: BreadthPlan;
-  searchFn: (params: { query: string; max_results: number; search_depth: string; include_raw_content: boolean }) => Promise<any>;
+  searchFn: (params: {
+    query: string;
+    max_results: number;
+    search_depth: string;
+    include_raw_content: boolean;
+    include_answer?: boolean;
+    chunks_per_source?: number;
+  }) => Promise<any>;
   maxResults?: number;
 }
 
@@ -278,7 +286,14 @@ export async function runBreadthSearches(opts: RunBreadthOpts): Promise<BreadthO
   const maxResults = opts.maxResults ?? RESEARCH_BREADTH_MAX_RESULTS;
   const settled = await Promise.allSettled(
     opts.plan.breadth.map((q) =>
-      opts.searchFn({ query: q.question, max_results: maxResults, search_depth: 'basic', include_raw_content: true })
+      opts.searchFn({
+        query: q.question,
+        max_results: maxResults,
+        search_depth: 'basic',
+        include_raw_content: true,
+        include_answer: false,
+        chunks_per_source: RESEARCH_CHUNKS_PER_SOURCE,
+      })
     )
   );
   const briefs: BriefResult[] = [];
@@ -398,7 +413,14 @@ export interface DepthOutcome {
 
 export interface RunDepthOpts {
   plan: DepthPlan;
-  searchFn: (params: { query: string; max_results: number; search_depth: string; include_raw_content: boolean }) => Promise<any>;
+  searchFn: (params: {
+    query: string;
+    max_results: number;
+    search_depth: string;
+    include_raw_content: boolean;
+    include_answer?: boolean;
+    chunks_per_source?: number;
+  }) => Promise<any>;
   maxResults?: number;
   deadlineMs?: number; // 总墙钟；循环内每条前检查，不足则放弃剩余 depth（§6）
 }
@@ -420,7 +442,12 @@ export async function runDepthSearches(opts: RunDepthOpts): Promise<DepthOutcome
     executed++;
     try {
       const data = await opts.searchFn({
-        query: item.question, max_results: maxResults, search_depth: 'basic', include_raw_content: true,
+        query: item.question,
+        max_results: maxResults,
+        search_depth: 'basic',
+        include_raw_content: true,
+        include_answer: false,
+        chunks_per_source: RESEARCH_CHUNKS_PER_SOURCE,
       });
       const results = data?.results;
       if (!Array.isArray(results)) {
@@ -560,7 +587,14 @@ export interface RunResearchResult {
 export interface RunResearchOpts {
   task: string;
   config: ResearchConfig;
-  searchFn: (params: { query: string; max_results: number; search_depth: string; include_raw_content: boolean }) => Promise<any>;
+  searchFn: (params: {
+    query: string;
+    max_results: number;
+    search_depth: string;
+    include_raw_content: boolean;
+    include_answer?: boolean;
+    chunks_per_source?: number;
+  }) => Promise<any>;
   chatFn?: (opts: ChatOpts) => Promise<ChatResult>;
 }
 
