@@ -3,3 +3,7 @@ build/
 .env*
 !.env.example
 tmp/
+test/
+*.test.mjs
+*.test.js
+*.test.ts

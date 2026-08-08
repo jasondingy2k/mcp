@@ -42,3 +42,12 @@ tmp/
 **/research-smoke*.md
 **/smoke-md/
 **/smoke-*.md
+
+# --- Local-only: development / test scripts (do not upload) ---
+**/test/
+**/*.test.mjs
+**/*.test.js
+**/*.test.ts
+**/*.spec.mjs
+**/*.spec.js
+**/*.spec.ts

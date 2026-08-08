@@ -2,3 +2,7 @@ node_modules/
 build/
 .env*
 !.env.example
+test/
+*.test.mjs
+*.test.js
+*.test.ts
