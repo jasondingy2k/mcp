@@ -1,0 +1,24 @@
+{
+  "name": "deepseek-vision",
+  "version": "0.3.0",
+  "description": "Clipboard-first vision MCP (OpenCode Go MiMo-V2.5) for DeepSeek-based text-only agents",
+  "type": "module",
+  "bin": {
+    "deepseek-vision": "build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && node -e \"try{require('fs').chmodSync('build/index.js','755')}catch(e){}\"",
+    "watch": "tsc --watch"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "mcp-common": "file:../mcp-common",
+    "openai": "^7.4.0",
+    "sharp": "^0.35.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "typescript": "^5.3.3"
+  }
+}

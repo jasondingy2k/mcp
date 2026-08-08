@@ -1,0 +1,16 @@
+{
+  "name": "mcp-common",
+  "version": "0.1.0",
+  "description": "自研 MCP 服务器的共享工作区约定：.env 加载、错误前缀、静默日志（单一实现）",
+  "type": "module",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "typescript": "^5.3.3"
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "name": "deepseek-websearch",
+  "version": "0.2.22",
+  "mcpName": "local/deepseek-websearch",
+  "description": "MCP server for advanced web search using Tavily (deepseek-websearch, fork of tavily-mcp v0.2.22)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tavily-ai/tavily-mcp.git"
+  },
+  "type": "module",
+  "bin": {
+    "deepseek-websearch": "build/index.js"
+  },
+  "files": [
+    "build"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
+    "prepare": "npm run build",
+    "watch": "tsc --watch",
+    "inspector": "npx @modelcontextprotocol/inspector build/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "tavily-mcp",
+    "tavily",
+    "mcp",
+    "crawl",
+    "model-context-protocol",
+    "websearch",
+    "claude",
+    "claude-desktop",
+    "search-api",
+    "web-search",
+    "ai-search",
+    "anthropic",
+    "real-time-search",
+    "search-tools",
+    "tavily-api",
+    "tavily-search",
+    "tavily-extract",
+    "web-extraction",
+    "data-extraction",
+    "search-integration"
+  ],
+  "author": "Tavily",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "axios": "^1.6.7",
+    "mcp-common": "file:../mcp-common",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/yargs": "^17.0.32",
+    "typescript": "^5.3.3"
+  }
+}

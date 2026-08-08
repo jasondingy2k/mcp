@@ -1,0 +1,44 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude / local agent session
+.claude/
+
+# Dependencies & build artifacts
+node_modules/
+build/
+dist/
+*.tsbuildinfo
+
+# Secrets (keep *.example)
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local backups & scratch
+backups/
+tmp/
+**/*.bak
+**/*.bak-*
+*.log
+
+# --- Local-only: development docs (do not upload) ---
+/AGENTS.md
+/MCP-交接报告*.md
+/MCP开发原则*.md
+/开发原则/
+
+# --- Local-only: samples & fixtures (do not upload) ---
+/测试素材/
+/test/
+**/research-smoke*.md
+**/smoke-md/
+**/smoke-*.md
