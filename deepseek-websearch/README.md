@@ -24,6 +24,16 @@ npm run build
 node build/index.js        # stdio 传输，接入 CC Switch / Claude Code 等 MCP 客户端
 ```
 
+## Skill
+
+配套 Agent Skill 在本目录 [`SKILL.md`](./SKILL.md)（何时用哪个 `deepseek_*` 工具）。官方工具名映射见 [`TOOLMAP.md`](./TOOLMAP.md)。
+
+接入 CC Switch / Grok 时，把 skill 目录指到本包即可，例如：
+
+```bash
+ln -sfn /Users/jason/mcp/deepseek-websearch ~/.cc-switch/skills/deepseek-websearch
+```
+
 ## 配置
 
 | 环境变量 | 说明 |
