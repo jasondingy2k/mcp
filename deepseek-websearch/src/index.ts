@@ -141,12 +141,30 @@ export function validateSearchPayload(data: any, provider: string): void {
 const EXA_CATEGORY_RE =
   /\bcategory:(company|publication|news|pdf|github|personal\s*site|people|financial report)\b/i;
 
+/**
+ * 剥 `category:` token。cleaned 为空时不回落原串（由 search 入口 ValidationError）。
+ * search 在进池前统一调用；Tavily 只用干净 query；Exa 另带 category 参数。
+ */
 export function parseExaCategory(query: string): { query: string; category?: string } {
   const m = query.match(EXA_CATEGORY_RE);
   if (!m) return { query };
   const category = m[1].toLowerCase().replace(/\s+/g, ' ');
   const cleaned = query.replace(m[0], '').replace(/\s+/g, ' ').trim();
-  return { query: cleaned || query.trim(), category };
+  return { query: cleaned, category };
+}
+
+/** max_results 钳制到 schema 的 1–20（缺省/非法 → fallback）。 */
+export function clampMaxResults(value: unknown, fallback = 5): number {
+  const n = typeof value === 'number' ? value : fallback;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(20, Math.max(1, Math.floor(n)));
+}
+
+/** extract：无成功 results 且有 failed_results → 全失败。 */
+export function isExtractTotalFailure(response: TavilyResponse): boolean {
+  const results = Array.isArray(response.results) ? response.results : [];
+  const failed = Array.isArray(response.failed_results) ? response.failed_results : [];
+  return results.length === 0 && failed.length > 0;
 }
 
 /** Exa 单条结果正文上限（API text.maxCharacters + 映射层双保险）。 */
@@ -154,11 +172,19 @@ export const EXA_CONTENT_MAX_CHARS = 1200;
 
 // Map the search params that Exa understands; the rest are ignored.
 // 轻量：显式 text 封顶 + highlights 封顶；禁止只开 highlights:true（实测仍可能带回全文 text）。
+// category 优先用上游已剥好的 params.category；否则再从 query 解析（直连/单测）。
 export function buildExaPayload(params: any): Record<string, any> {
-  const { query, category } = parseExaCategory(String(params.query ?? ''));
+  let query = String(params.query ?? '');
+  let category: string | undefined =
+    typeof params.category === 'string' && params.category ? params.category : undefined;
+  if (!category) {
+    const parsed = parseExaCategory(query);
+    query = parsed.query;
+    category = parsed.category;
+  }
   const payload: Record<string, any> = {
     query,
-    numResults: typeof params.max_results === 'number' ? params.max_results : 5,
+    numResults: clampMaxResults(params.max_results),
     type: 'auto',
     contents: {
       text: { maxCharacters: EXA_CONTENT_MAX_CHARS },
@@ -397,6 +423,8 @@ interface TavilyResponse {
     url?: string;
     error?: string;
   } | string>;
+  /** 内部：search 实际命中的引擎；formatResults 读后输出 Provider 行，不进 answer */
+  _provider?: 'tavily' | 'exa';
 }
 
 interface TavilyCrawlResponse {
@@ -888,13 +916,25 @@ class TavilyClient {
             );
         }
 
+        const text = formatResults(response);
+        // ② extract 全失败（无 results + 有 failed_results）→ isError
+        if (request.params.name === 'deepseek_extract' && isExtractTotalFailure(response)) {
+          return {
+            content: [{ type: "text", text }],
+            isError: true,
+          };
+        }
         return {
-          content: [{
-            type: "text",
-            text: formatResults(response)
-          }]
+          content: [{ type: "text", text }]
         };
       } catch (error: any) {
+        // ⑥ 剥 category 后 query 为空等校验失败
+        if (error?.name === 'ValidationError') {
+          return {
+            content: [{ type: "text", text: toolError('ValidationError', String(error.message ?? error)) }],
+            isError: true,
+          };
+        }
         if (axios.isAxiosError(error)) {
           if (isKeylessEnvelope(error.response?.data)) {
             return {
@@ -1008,6 +1048,21 @@ class TavilyClient {
       // false 被上面跳过了——显式关闭 answer 时不要发给 API（等同 omit）
       // 若需「无 answer」：omit 即可；cleaned 不含 false 正确。
 
+      // ①⑥ 统一剥 category:（进池前）；空 query → ValidationError，不回落原串
+      const parsed = parseExaCategory(String(cleanedParams.query ?? ''));
+      if (parsed.category !== undefined && !parsed.query) {
+        const err = new Error('query 在剥离 category: 后为空');
+        err.name = 'ValidationError';
+        throw err;
+      }
+      cleanedParams.query = parsed.query;
+      if (parsed.category) cleanedParams.category = parsed.category;
+
+      // ⑤ max_results 钳 1–20
+      if (typeof cleanedParams.max_results === 'number') {
+        cleanedParams.max_results = clampMaxResults(cleanedParams.max_results);
+      }
+
       return this.searchWithKeyPool(cleanedParams);
   }
 
@@ -1042,11 +1097,17 @@ class TavilyClient {
     const totalTimer = setTimeout(() => controller.abort(), SEARCH_FAILOVER_TOTAL_TIMEOUT_MS);
 
     try {
+      // Tavily 不认 category（仅 Exa）；请求体剥掉，避免字面泄漏
+      const tavilyBody = (() => {
+        const { category: _cat, ...rest } = payload;
+        return rest;
+      })();
+
       // ---- 无任何池：现网 keyless 行为（Tavily keyless，不建池）----
       if (SEARCH_CANDIDATES.length === 0) {
         try {
           const response = await retryTransientHttp(() =>
-            this.axiosInstance.post(this.baseURLs.search, payload, {
+            this.axiosInstance.post(this.baseURLs.search, tavilyBody, {
               headers: this.tavilyHeaders(undefined),
               timeout: SEARCH_PROVIDER_TIMEOUT_MS,
               signal: controller.signal,
@@ -1054,7 +1115,9 @@ class TavilyClient {
           );
           raiseForStatus('Tavily', response.status, bodyText(response.data));
           validateSearchPayload(response.data, 'Tavily');
-          return response.data;
+          const data: TavilyResponse = response.data;
+          data._provider = 'tavily';
+          return data;
         } catch (err) {
           throw toProviderFailure('Tavily', err, 'tavily');
         }
@@ -1072,7 +1135,7 @@ class TavilyClient {
               if (cand.provider === 'tavily') {
                 const response = await retryTransientHttp(() =>
                   this.axiosInstance.post(this.baseURLs.search, {
-                    ...payload,
+                    ...tavilyBody,
                     api_key: cand.key,
                   }, {
                     headers: this.tavilyHeaders(cand.key),
@@ -1119,6 +1182,8 @@ class TavilyClient {
       if (picked && attempts.length > 0) {
         picked.data.answer = `[retried on ${picked.provider} after: ${attempts[0].slice(0, 160)}]`;
       }
+      // ③ 挂内部 _provider，供 formatResults 输出（不进 answer）
+      picked!.data._provider = picked!.provider;
       return picked!.data;
     } finally {
       clearTimeout(totalTimer);
@@ -1307,6 +1372,11 @@ function formatKeylessEnvelope(data: any): string {
 export function formatResults(response: TavilyResponse): string {
   // Format API response into human-readable text
   const output: string[] = [];
+
+  // ③ Provider 独立一行（不进 answer，避免与 Tavily Answer 糊在一起）
+  if (response._provider === 'tavily' || response._provider === 'exa') {
+    output.push(`Provider: ${response._provider}`);
+  }
 
   // Include answer if available
   if (response.answer) {
