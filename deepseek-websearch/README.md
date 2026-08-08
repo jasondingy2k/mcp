@@ -8,11 +8,11 @@ fork 自 [tavily-ai/tavily-mcp](https://github.com/tavily-ai/tavily-mcp) v0.2.22
 
 | 工具 | 功能 |
 |---|---|
-| `deepseek_search` | AI 实时搜索（搜索深度、时间范围、域名过滤、图片等）；Tavily 失败（5xx/超时/畸形响应）自动切 Exa 回退；鉴权/配额/限流（401/403/402/429）不回退 |
-| `deepseek_extract` | 指定 URL 正文提取（markdown / text） |
-| `deepseek_map` | 域名 → URL 列表（站点结构地图） |
-| `deepseek_crawl` | 站点爬取（建任务 + 轮询，可配深度/广度/路径过滤） |
-| `deepseek_research` | 深度研究报告（主代理先广后深：广度并行 + 深度串行 + 综合报告；成本 5–10 点，封顶） |
+| `deepseek_search` | AI 实时搜索（搜索深度、时间范围、域名过滤、图片等）；**多 key 加权轮询**：Tavily/Exa 池内按权重选 key，单次请求内失败（含 401/402/429）换下一 key |
+| `deepseek_extract` | 指定 URL 正文提取（markdown / text）；**Tavily 池内轮询选 key** |
+| `deepseek_map` | 域名 → URL 列表（站点结构地图）；**Tavily 池内轮询选 key** |
+| `deepseek_crawl` | 站点爬取（建任务 + 轮询，可配深度/广度/路径过滤）；**Tavily 池内轮询选 key** |
+| `deepseek_research` | 深度研究报告（主代理先广后深：广度并行 + 深度串行 + 综合报告；成本 5–10 点，封顶）；内部 search 走同一 key 池 |
 
 ## 构建与运行
 
@@ -38,8 +38,10 @@ ln -sfn /Users/jason/mcp/deepseek-websearch ~/.cc-switch/skills/deepseek-websear
 
 | 环境变量 | 说明 |
 |---|---|
-| `TAVILY_API_KEY` | Tavily API key。缺省时进入 keyless 模式（`X-Tavily-Access-Mode: keyless`），仅 `deepseek_search` / `deepseek_extract` 可用 |
-| `EXA_API_KEY` | 可选。Exa API key，`deepseek_search` 的失败回退引擎（auth 类失败不回退） |
+| `TAVILY_API_KEY` | Tavily API key（**一个或多个，逗号分隔**，如 `tvly-a,tvly-b`）。缺省时进入 keyless 模式（`X-Tavily-Access-Mode: keyless`），仅 `deepseek_search` / `deepseek_extract` 可用 |
+| `EXA_API_KEY` | 可选。Exa API key（**一个或多个，逗号分隔**）。`deepseek_search` 在 Tavily/Exa 池中按权重选 key；extract/crawl/map 仅用 Tavily 池 |
+| `EXASEARCH_API_KEY` | 可选。Exa 别名；仅当 `EXA_API_KEY` 为空时使用（同样逗号解析） |
+| `TAVILY_KEY_WEIGHT` / `EXA_KEY_WEIGHT` | 可选。多 key 加权轮询权重（正整数）；默认 `1000` / `1400`（按免费额度比例校准；额度变更用 env 覆盖，不改代码） |
 | `TAVILY_HUMAN_ID` | 可选。请求归因用 Human ID（Tavily 侧 SHA-256 哈希后存储） |
 | `DEFAULT_PARAMETERS` | 可选。JSON 字符串，设置工具参数默认值，如 `{"search_depth":"advanced","include_images":true}` |
 | `RESEARCH_API_KEY` | 可选。research 主代理 LLM key；缺省时 `deepseek_research` 明确报错（不回退官方动态计费；与 vision 的 key 独立） |
@@ -55,7 +57,7 @@ ln -sfn /Users/jason/mcp/deepseek-websearch ~/.cc-switch/skills/deepseek-websear
 
 - **错误可定位**：工具错误返回 `[deepseek-websearch 内部错误] <异常类型>: <信息>`；长任务超时带阶段标注（`（卡在 tavily）` / `（卡在 exa）` / `（卡在 research 广度规划/广度搜索/深度规划/深度搜索/综合）`）；
 - **默认静默日志**：诊断信息进工具返回文本，不落日志文件；排错时设 `DEEPSEEK_WEBSEARCH_LOG_LEVEL`；
-- **超时护栏**：`deepseek_search` 单 provider 30s、Tavily→Exa 全程 60s 总预算（超时报 `（卡在 tavily / exa）`）；`deepseek_research` 主代理编排：总墙钟 **480s 硬上限**（规划单次 60s×重试、深度串行每条前检查剩余、综合 120s），阶段标注 `（卡在 research 广度规划/广度搜索/深度规划/深度搜索/综合）`；
+- **超时护栏**：`deepseek_search` 单 provider 30s、单次请求 key 池全程 **60s** 总预算（超时报 `（卡在 tavily / exa）`，按当前尝试的 provider 标注）；`deepseek_research` 主代理编排：总墙钟 **480s 硬上限**（规划单次 60s×重试、深度串行每条前检查剩余、综合 120s），阶段标注 `（卡在 research 广度规划/广度搜索/深度规划/深度搜索/综合）`；
 - **原子写**：写文件走临时文件 + rename（当前无持久化文件，预留约定）。
 
 ## 已知事项（记录在案）
@@ -71,6 +73,7 @@ ln -sfn /Users/jason/mcp/deepseek-websearch ~/.cc-switch/skills/deepseek-websear
 - [x] extract/map 超时护栏（120s / 30s）；crawl 建任务+轮询（退避 1.5 / 5 分钟预算 / 阶段标注）
 - [x] 真实 API smoke test（2026-08-07：A1.1–A1.8 全过；A1.3 Exa 回退为单测覆盖，活体触发需 quota/5xx）
 - [x] research 主代理改造（2026-08-08）：先广后深编排替代官方 `/research`；5–10 点封顶 + 3 次模型；70 单测；`RESEARCH_*` 配置；6 轮真实 smoke 收敛（综合删 `max_tokens` 帽 + 深度规划输入瘦身首 300 字，见设计文档 §11）
+- [x] 多 key 加权负载均衡（2026-08-08）：Tavily/Exa key 逗号多 key + WRR 选 key（默认 1000/1400，env 可覆盖）；search 成功路径按权重选引擎；单次请求失败换池内下一 key；extract/crawl/map 仅 Tavily 池；`shouldFallbackToExa` → `shouldRetryNextKey`（全 kind 换 key）；83 单测
 
 ## License
 

@@ -15,17 +15,41 @@ import { makeLogger } from './logging.js';
 import { makeToolError } from './errors.js';
 import { redactSensitive } from './redact.js';
 import { readResearchConfig, runResearch } from './research.js';
+import {
+  parseApiKeys,
+  parseKeyWeight,
+  WeightedRoundRobin,
+  retryOverPool,
+  shouldRetryNextKey,
+  type KeyCandidate,
+} from './keypool.js';
 export * from './research.js';
 export { redactSensitive };
 export { parseEnvValue, loadEnvFile } from './env.js';
 export { makeToolError } from './errors.js';
 export { makeLogger } from './logging.js';
+export { parseApiKeys, parseKeyWeight, WeightedRoundRobin, retryOverPool, shouldRetryNextKey } from './keypool.js';
 
 // .env 约定：启动时只加载一次。
 loadEnvFile();
 
-const API_KEY = process.env.TAVILY_API_KEY;
-const IS_KEYLESS = !API_KEY;
+// ---- 多 key 加权负载均衡（多 key 方案 2026-08-08 §5）----
+// TAVILY_API_KEY / EXA_API_KEY 逗号分隔多 key，N 不写死；权重默认 1000/1400（env 可覆盖）。
+const TAVILY_KEYS = parseApiKeys(process.env.TAVILY_API_KEY);
+const EXA_KEYS = parseApiKeys(process.env.EXA_API_KEY || process.env.EXASEARCH_API_KEY);
+const TAVILY_KEY_WEIGHT = parseKeyWeight(process.env.TAVILY_KEY_WEIGHT, 1000);
+const EXA_KEY_WEIGHT = parseKeyWeight(process.env.EXA_KEY_WEIGHT, 1400);
+// keyless 判定与现网一致：无任何 Tavily key → 走 Tavily keyless（extract/crawl/map 依赖）。
+const IS_KEYLESS = TAVILY_KEYS.length === 0;
+// search 全池（Tavily + Exa）；extract/crawl/map 仅 Tavily 池。
+const SEARCH_CANDIDATES: KeyCandidate[] = [
+  ...TAVILY_KEYS.map((key) => ({ provider: 'tavily' as const, key, weight: TAVILY_KEY_WEIGHT })),
+  ...EXA_KEYS.map((key) => ({ provider: 'exa' as const, key, weight: EXA_KEY_WEIGHT })),
+];
+const TAVILY_CANDIDATES: KeyCandidate[] = SEARCH_CANDIDATES.filter((c) => c.provider === 'tavily');
+const searchPool = new WeightedRoundRobin(SEARCH_CANDIDATES);
+const tavilyPool = new WeightedRoundRobin(TAVILY_CANDIDATES);
+
 const HUMAN_ID = process.env.TAVILY_HUMAN_ID;
 const SESSION_ID = randomUUID();
 
@@ -33,9 +57,7 @@ const SESSION_ID = randomUUID();
 const log = makeLogger('deepseek-websearch', 'DEEPSEEK_WEBSEARCH_LOG_LEVEL');
 export const toolError = makeToolError('deepseek-websearch');
 
-// ---- Tavily→Exa search failover (workspace convention, ported from
-// agent-websearch providers.py search_with_failover) ----
-const EXA_API_KEY = process.env.EXA_API_KEY || process.env.EXASEARCH_API_KEY;
+// ---- Tavily→Exa search 池化（多 key 加权负载均衡方案 2026-08-08 §5）----
 const SEARCH_PROVIDER_TIMEOUT_MS = 30000;       // per-provider HTTP budget
 const SEARCH_FAILOVER_TOTAL_TIMEOUT_MS = 60000; // total Tavily→Exa sequence budget
 const EXTRACT_TIMEOUT_MS = 120000;              // extract: minute-level budget (multi-URL)
@@ -66,8 +88,9 @@ export class SearchProviderFailure extends Error {
 }
 
 // Classify a non-2xx status into a failure kind: 5xx/network → error;
-// 401/403 → auth; 402/429 → quota/rate. Only `error` may soft-fallback to Exa
-// (auth/quota/rate never fallback — see shouldFallbackToExa).
+// 401/403 → auth; 402/429 → quota/rate.
+// 旧 shouldFallbackToExa（仅 error 切 Exa）已拆除：多 key 方案改为全 kind 换下一 key
+// （shouldRetryNextKey 恒 true，见 keypool.ts）。
 export function classifyNonSuccess(status: number, text: string): SearchFailureKind {
   const lower = text.toLowerCase();
   if (status >= 500) return 'error';
@@ -82,11 +105,6 @@ export function classifyNonSuccess(status: number, text: string): SearchFailureK
   if (quotaHints.some((n) => lower.includes(n))) return 'quota';
   if (lower.includes('rate limit') || lower.includes('too many requests')) return 'rate';
   return 'error';
-}
-
-/** Exa fallback only for non-auth, non-quota, non-rate failures (5xx/timeout/malformed). */
-export function shouldFallbackToExa(kind: SearchFailureKind): boolean {
-  return kind === 'error';
 }
 
 function raiseForStatus(provider: string, status: number, text: string, data: any = null): void {
@@ -266,13 +284,12 @@ class TavilyClient {
       }
     );
 
+    // 不再在 axios.create 写死单个 Authorization/keyless（多 key 方案 §6 步骤 4）：
+    // 通用头保留；Tavily 请求每次按所选 key 注入 Authorization / keyless 头。
     this.axiosInstance = axios.create({
       headers: {
         'accept': 'application/json',
         'content-type': 'application/json',
-        ...(IS_KEYLESS
-          ? { 'X-Tavily-Access-Mode': 'keyless', 'X-Client-Source': 'deepseek-websearch-keyless' }
-          : { 'Authorization': `Bearer ${API_KEY}`, 'X-Client-Source': 'MCP' }),
         'X-Session-Id': SESSION_ID,
         ...(HUMAN_ID ? { 'X-Human-Id': HUMAN_ID } : {}),
       }
@@ -743,7 +760,7 @@ class TavilyClient {
 
   async search(params: any): Promise<TavilyResponse> {
       const defaults = this.getDefaultParameters();
-      
+
       // Prepare the request payload (official logic preserved)
       const searchParams: any = {
         query: params.query,
@@ -761,119 +778,156 @@ class TavilyClient {
         start_date: params.start_date,
         end_date: params.end_date,
         exact_match: params.exact_match,
-        ...(IS_KEYLESS ? {} : { api_key: API_KEY }),
       };
-      
+      // api_key 不再写死全局（多 key 方案 §6 步骤 4）：在 searchWithKeyPool 内按所选 key 注入。
+
       // DEFAULT_PARAMETERS 只填用户未传的字段，不覆盖显式参数
       for (const key in defaults) {
         if (searchParams[key] === undefined) {
           searchParams[key] = defaults[key];
         }
       }
-      
+
       // We have to set defaults due to the issue with optional parameter types or defaults = None
       // Because of this, we have to set the time_range to None if start_date or end_date is set
       // or else start_date and end_date will always cause errors when sent
       if ((searchParams.start_date || searchParams.end_date) && searchParams.time_range) {
         searchParams.time_range = undefined;
       }
-      
+
       // Remove empty values
       const cleanedParams: any = {};
       for (const key in searchParams) {
         const value = searchParams[key];
         // Skip empty strings, null, undefined, and empty arrays
-        if (value !== "" && value !== null && value !== undefined && 
+        if (value !== "" && value !== null && value !== undefined &&
             !(Array.isArray(value) && value.length === 0)) {
           cleanedParams[key] = value;
         }
       }
-      
-      return this.searchWithFailover(cleanedParams);
+
+      return this.searchWithKeyPool(cleanedParams);
   }
 
-  // Tavily first; Exa only on kind=error（5xx/超时/畸形）. auth/quota/rate 不切换。
-  // Total budget SEARCH_FAILOVER_TOTAL_TIMEOUT_MS；超时标注（卡在 tavily / exa）.
-  private async searchWithFailover(payload: any): Promise<TavilyResponse> {
+  /** Tavily 请求头：有 key → Authorization Bearer；无 key（keyless）→ keyless access mode。 */
+  private tavilyHeaders(key?: string): Record<string, string> {
+    return key
+      ? { 'Authorization': `Bearer ${key}`, 'X-Client-Source': 'MCP' }
+      : { 'X-Tavily-Access-Mode': 'keyless', 'X-Client-Source': 'deepseek-websearch-keyless' };
+  }
+
+  /** Tavily 池选 key 并重试：选中的 key 失败 → 试下一 key（全 kind 换 key）；全失败聚合抛错。 */
+  private async withTavilyKey<T>(run: (key: string | undefined) => Promise<T>): Promise<T> {
+    if (TAVILY_CANDIDATES.length === 0) {
+      return run(undefined); // keyless
+    }
+    try {
+      const { value } = await retryOverPool<T>(tavilyPool, (cand) => run(cand.key));
+      return value;
+    } catch (err) {
+      throw new SearchProviderFailure(
+        err instanceof Error ? err.message : String(err),
+        null,
+        'error'
+      );
+    }
+  }
+
+  // 多 key 加权轮询（方案 §5）：按权重选引擎+key，单次请求内失败试完池中每个 key 一次。
+  // 全池空 → 现网 keyless 行为（Tavily keyless）。总墙钟 SEARCH_FAILOVER_TOTAL_TIMEOUT_MS。
+  private async searchWithKeyPool(payload: any): Promise<TavilyResponse> {
     const controller = new AbortController();
     const totalTimer = setTimeout(() => controller.abort(), SEARCH_FAILOVER_TOTAL_TIMEOUT_MS);
-    const errors: string[] = [];
-    let tavilyHttp: number | null = null;
-    let fallbackReason: SearchFailureKind | null = null;
-    let phase: 'tavily' | 'exa' | null = null;
 
     try {
-      // ---- Tavily (primary) ----
-      phase = 'tavily';
-      try {
-        const response = await this.axiosInstance.post(this.baseURLs.search, payload, {
-          timeout: SEARCH_PROVIDER_TIMEOUT_MS,
-          signal: controller.signal,
-        });
-        raiseForStatus('Tavily', response.status, bodyText(response.data));
-        validateSearchPayload(response.data, 'Tavily');
-        return response.data;
-      } catch (err: any) {
-        const failure = toProviderFailure('Tavily', err, phase);
-        tavilyHttp = failure.http;
-        if (!shouldFallbackToExa(failure.kind)) {
-          throw failure; // auth / quota / rate: never soft-fallback to Exa
-        }
-        errors.push(failure.message);
-        fallbackReason = failure.kind;
-      }
-
-      // ---- Exa (fallback) ----
-      if (EXA_API_KEY) {
-        phase = 'exa';
+      // ---- 无任何池：现网 keyless 行为（Tavily keyless，不建池）----
+      if (SEARCH_CANDIDATES.length === 0) {
         try {
-          const response = await axios.post(
-            'https://api.exa.ai/search',
-            buildExaPayload(payload),
-            {
-              headers: {
-                'x-api-key': EXA_API_KEY,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              timeout: SEARCH_PROVIDER_TIMEOUT_MS,
-              signal: controller.signal,
-            }
-          );
-          raiseForStatus('Exa', response.status, bodyText(response.data));
-          validateSearchPayload(response.data, 'Exa');
-          const result = mapExaResultsToTavily(response.data);
-          // 优先给完整失败详情（errors[0] 已脱敏），fallbackReason 只是 kind 无信息量
-          result.answer = `[fallback: used Exa after Tavily issue: ${(errors[0] ?? fallbackReason ?? 'error').slice(0, 160)}]`;
-          return result;
-        } catch (err: any) {
-          errors.push(toProviderFailure('Exa', err, phase).message);
-          throw new SearchProviderFailure(
-            `All providers failed:\n- ${errors.join('\n- ')}`,
-            tavilyHttp,
-            'error'
-          );
+          const response = await this.axiosInstance.post(this.baseURLs.search, payload, {
+            headers: this.tavilyHeaders(undefined),
+            timeout: SEARCH_PROVIDER_TIMEOUT_MS,
+            signal: controller.signal,
+          });
+          raiseForStatus('Tavily', response.status, bodyText(response.data));
+          validateSearchPayload(response.data, 'Tavily');
+          return response.data;
+        } catch (err) {
+          throw toProviderFailure('Tavily', err, 'tavily');
         }
       }
 
-      throw new SearchProviderFailure(
-        `No working search provider. Set TAVILY_API_KEY and/or EXA_API_KEY.\n${errors.join('\n')}`,
-        tavilyHttp,
-        fallbackReason ?? 'error'
-      );
+      // ---- 池化：WRR 选起始 key，失败按权重顺序换下一 key（§5.3 每 key 一次）----
+      let picked: { provider: 'tavily' | 'exa'; data: TavilyResponse } | null = null;
+      let attempts: string[] = [];
+      try {
+        ({ value: picked, attempts } = await retryOverPool<{ provider: 'tavily' | 'exa'; data: TavilyResponse }>(
+          searchPool,
+          async (cand) => {
+            const providerLabel = cand.provider === 'tavily' ? 'Tavily' : 'Exa';
+            try {
+              if (cand.provider === 'tavily') {
+                const response = await this.axiosInstance.post(this.baseURLs.search, {
+                  ...payload,
+                  api_key: cand.key,
+                }, {
+                  headers: this.tavilyHeaders(cand.key),
+                  timeout: SEARCH_PROVIDER_TIMEOUT_MS,
+                  signal: controller.signal,
+                });
+                raiseForStatus('Tavily', response.status, bodyText(response.data));
+                validateSearchPayload(response.data, 'Tavily');
+                return { provider: 'tavily' as const, data: response.data };
+              }
+              const response = await axios.post(
+                'https://api.exa.ai/search',
+                buildExaPayload(payload),
+                {
+                  headers: {
+                    'x-api-key': cand.key,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                  },
+                  timeout: SEARCH_PROVIDER_TIMEOUT_MS,
+                  signal: controller.signal,
+                }
+              );
+              raiseForStatus('Exa', response.status, bodyText(response.data));
+              validateSearchPayload(response.data, 'Exa');
+              return { provider: 'exa' as const, data: mapExaResultsToTavily(response.data) };
+            } catch (err) {
+              // axios 4xx/超时/网络必须走分类，否则丢失 kind 与「卡在 tavily/exa」标注
+              throw toProviderFailure(providerLabel, err, cand.provider);
+            }
+          }
+        ));
+      } catch (err) {
+        throw new SearchProviderFailure(
+          err instanceof Error ? err.message : String(err),
+          null, 'error'
+        );
+      }
+
+      // 重试成功（非首 key）→ 标注实际 provider 与失败原因（已脱敏）
+      if (picked && attempts.length > 0) {
+        picked.data.answer = `[retried on ${picked.provider} after: ${attempts[0].slice(0, 160)}]`;
+      }
+      return picked!.data;
     } finally {
       clearTimeout(totalTimer);
     }
   }
 
   async extract(params: any): Promise<TavilyResponse> {
-    const response = await this.axiosInstance.post(this.baseURLs.extract, {
-      ...params,
-      ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-    }, {
-      timeout: EXTRACT_TIMEOUT_MS,
+    return this.withTavilyKey(async (key) => {
+      const response = await this.axiosInstance.post(this.baseURLs.extract, {
+        ...params,
+        ...(key ? { api_key: key } : {}),
+      }, {
+        headers: this.tavilyHeaders(key),
+        timeout: EXTRACT_TIMEOUT_MS,
+      });
+      return response.data;
     });
-    return response.data;
   }
 
   async crawl(params: any): Promise<TavilyCrawlResponse> {
@@ -884,15 +938,18 @@ class TavilyClient {
 
     try {
       // ---- Submit the crawl job (Tavily /crawl is async: returns job_id) ----
-      const response = await this.axiosInstance.post(this.baseURLs.crawl, {
-        ...params,
-        ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-      }, {
-        timeout: CRAWL_SUBMIT_TIMEOUT_MS,
-        signal: controller.signal,
+      // Tavily 池选 key + 失败换下一 key；submit 成功返回 { data, key }，poll 沿用同一 key。
+      const { data, key } = await this.withTavilyKey(async (k) => {
+        const response = await this.axiosInstance.post(this.baseURLs.crawl, {
+          ...params,
+          ...(k ? { api_key: k } : {}),
+        }, {
+          headers: this.tavilyHeaders(k),
+          timeout: CRAWL_SUBMIT_TIMEOUT_MS,
+          signal: controller.signal,
+        });
+        return { data: response.data, key: k };
       });
-
-      const data = response.data;
 
       // Dual-mode: synchronous-style responses (already contain results) are
       // returned as-is; otherwise treat the response as a job handle.
@@ -904,7 +961,7 @@ class TavilyClient {
       if (!jobId) {
         throw new SearchProviderFailure(
           `deepseek_crawl: no job_id in submit response: ${bodyText(data).slice(0, 300)}`,
-          response.status, 'error'
+          null, 'error'
         );
       }
       crawlPhase = '轮询';
@@ -922,7 +979,7 @@ class TavilyClient {
         try {
           pollResponse = await this.axiosInstance.get(
             `${this.baseURLs.crawl}/${jobId}`,
-            { timeout: CRAWL_SUBMIT_TIMEOUT_MS, signal: controller.signal }
+            { headers: this.tavilyHeaders(key), timeout: CRAWL_SUBMIT_TIMEOUT_MS, signal: controller.signal }
           );
         } catch (pollErr: any) {
           if (pollErr.response?.status && pollErr.response.status >= 500) {
@@ -976,13 +1033,16 @@ class TavilyClient {
   }
 
   async map(params: any): Promise<TavilyMapResponse> {
-    const response = await this.axiosInstance.post(this.baseURLs.map, {
-      ...params,
-      ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-    }, {
-      timeout: MAP_TIMEOUT_MS,
+    return this.withTavilyKey(async (key) => {
+      const response = await this.axiosInstance.post(this.baseURLs.map, {
+        ...params,
+        ...(key ? { api_key: key } : {}),
+      }, {
+        headers: this.tavilyHeaders(key),
+        timeout: MAP_TIMEOUT_MS,
+      });
+      return response.data;
     });
-    return response.data;
   }
 
   /** Read at most maxBytes from a stream as text, then destroy it. */
