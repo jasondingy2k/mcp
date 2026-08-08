@@ -51,3 +51,7 @@ tmp/
 **/*.spec.mjs
 **/*.spec.js
 **/*.spec.ts
+
+# --- Local-only: non-runtime extras (do not upload) ---
+**/TOOLMAP.md
+**/assets/

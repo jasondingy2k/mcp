@@ -26,7 +26,7 @@ node build/index.js        # stdio 传输，接入 CC Switch / Claude Code 等 M
 
 ## Skill
 
-配套 Agent Skill 在本目录 [`SKILL.md`](./SKILL.md)（何时用哪个 `deepseek_*` 工具）。官方工具名映射见 [`TOOLMAP.md`](./TOOLMAP.md)。
+配套 Agent Skill 在本目录 [`SKILL.md`](./SKILL.md)（何时用哪个 `deepseek_*` 工具）。
 
 接入 CC Switch / Grok 时，把 skill 目录指到本包即可，例如：
 
