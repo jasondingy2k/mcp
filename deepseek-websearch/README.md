@@ -8,11 +8,19 @@ fork 自 [tavily-ai/tavily-mcp](https://github.com/tavily-ai/tavily-mcp) v0.2.22
 
 | 工具 | 功能 |
 |---|---|
-| `deepseek_search` | AI 实时搜索（搜索深度、时间范围、域名过滤、图片等）；**多 key 加权轮询**：Tavily/Exa 池内按权重选 key，单次请求内失败（含 401/402/429）换下一 key |
-| `deepseek_extract` | 指定 URL 正文提取（markdown / text）；**Tavily 池内轮询选 key** |
-| `deepseek_map` | 域名 → URL 列表（站点结构地图）；**Tavily 池内轮询选 key** |
-| `deepseek_crawl` | 站点爬取（建任务 + 轮询，可配深度/广度/路径过滤）；**Tavily 池内轮询选 key** |
-| `deepseek_research` | 深度研究报告（主代理先广后深：广度并行 + 深度串行 + 综合报告；成本 5–10 点，封顶）；内部 search 走同一 key 池 |
+| `deepseek_search` | 实时搜索；`search_depth` basic(1 credit,默认)\|advanced(2)；多 key 加权轮询 Tavily/Exa |
+| `deepseek_extract` | URL 正文提取；搜索片段不足时跟进；Tavily 池 |
+| `deepseek_map` | 站点 URL 列表；要正文 → `deepseek_crawl` / `deepseek_extract` |
+| `deepseek_crawl` | 站点爬取（异步 ~5 min）；仅要 URL 列表 → `deepseek_map` |
+| `deepseek_research` | 多步研究报告（成本封顶）；快查 → `deepseek_search` |
+
+## Agent 速查
+
+与 [`SKILL.md`](./SKILL.md) 一致：
+
+- **调用**：无原生 WebSearch 的后端；实时信息、文档、版本、报错
+- **勿调用**：OpenCode 内置搜索、DeepSeek 官方原生 WebSearch、纯本地问题、仅有 URL 时（用 extract）
+- **约束**：语义化 query；`basic` 默认；片段薄 → extract；引用返回 URL
 
 ## 构建与运行
 
@@ -26,7 +34,7 @@ node build/index.js        # stdio 传输，接入 CC Switch / Claude Code 等 M
 
 ## Skill
 
-配套 Agent Skill 在本目录 [`SKILL.md`](./SKILL.md)（何时用哪个 `deepseek_*` 工具）。
+配套 Agent Skill：[`SKILL.md`](./SKILL.md)（工具路由与约束）。
 
 接入 CC Switch / Grok 时，把 skill 目录指到本包即可，例如：
 

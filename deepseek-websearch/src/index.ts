@@ -547,7 +547,7 @@ class TavilyClient {
       const tools: Tool[] = [
         {
           name: "deepseek_search",
-          description: "MUST use for live web info. Prefer semantic page description over keywords; default basic depth (1 credit; advanced=2). URLs→deepseek_extract; deep reports→deepseek_research. Thin snippets→extract best URLs.",
+          description: "Live web search. query required. search_depth basic(1 credit,default)|advanced(2). For URLs use deepseek_extract; deep report use deepseek_research.",
           inputSchema: {
             type: "object",
             properties: {
@@ -558,7 +558,7 @@ class TavilyClient {
               search_depth: {
                 type: "string",
                 enum: ["basic","advanced","fast","ultra-fast"],
-                description: "basic=1 credit (default); advanced=2 for precise facts",
+                description: "basic|advanced; credit 1|2",
                 default: "basic"
               },
               topic: {
@@ -611,7 +611,7 @@ class TavilyClient {
               },
               country: {
                 type: "string",
-                description: "Boost country by full name (e.g. 'Japan'; ISO codes like 'us' not supported)"
+                description: "full country name; not ISO code"
               },
               exact_match: {
                 type: "boolean",
@@ -623,7 +623,7 @@ class TavilyClient {
         },
         {
           name: "deepseek_extract",
-          description: "Extract full page content from URLs (batch OK). Use after search when snippets are thin. Do NOT use deepseek_search for URL extraction.",
+          description: "Extract page content from URLs. After search when snippets thin.",
           inputSchema: {
             type: "object",
             properties: {
@@ -660,7 +660,7 @@ class TavilyClient {
         },
         {
           name: "deepseek_crawl",
-          description: "Crawl a site for page content (async, ~5 min). For URL list only, use deepseek_map.",
+          description: "Crawl site for page content (async, ~5 min wall). URL list only → deepseek_map.",
           inputSchema: {
             type: "object",
             properties: {
@@ -723,7 +723,7 @@ class TavilyClient {
         },
         {
           name: "deepseek_map",
-          description: "List a site's URLs from a base URL. For page content use deepseek_crawl or deepseek_extract.",
+          description: "List site URLs from base URL. Content → deepseek_crawl or deepseek_extract.",
           inputSchema: {
             type: "object",
             properties: {
@@ -774,7 +774,7 @@ class TavilyClient {
         },
         {
           name: "deepseek_research",
-          description: "Depth research report（主代理先广后深：5–10 次 basic search + 综合报告，成本封顶 10 点）。For a quick query use deepseek_search.",
+          description: "Multi-step research report (capped cost). Quick fact → deepseek_search.",
           inputSchema: {
             type: "object",
             properties: {
@@ -1344,25 +1344,21 @@ function isKeylessEnvelope(data: any): boolean {
 }
 
 function formatKeylessEnvelope(data: any): string {
-  // Render the Tavily API's recoverable-error envelope as plain text:
-  // the natural-language message, followed by retry-after (when present).
   const err = data.error;
   const lines: string[] = [String(err.message ?? '')];
   if (err.retry_after_seconds != null) {
     lines.push(`Retry after: ${err.retry_after_seconds}s`);
   }
-  if (Array.isArray(err.next_actions) && err.next_actions.length > 0) {
-    lines.push('', 'Continuation options:');
+  if (Array.isArray(err.next_actions)) {
     for (const a of err.next_actions) {
       if (a?.type === 'agentic_payment') {
-        lines.push(`- Agentic payment (${a.scheme ?? 'x402'}): ${a.details ?? ''}`);
+        const detail = a.details ? ` ${a.details}` : '';
+        lines.push(`agentic_payment scheme=${a.scheme ?? 'x402'}${detail}`);
       } else if (a?.type === 'signup') {
-        lines.push(`- Sign up for a Tavily API key: ${a.url ?? ''}`);
+        const url = a.url ? ` ${a.url}` : '';
+        lines.push(`TAVILY_API_KEY required${url}`);
       } else if (a?.type === 'bonus_credits' && a.eligible) {
-        lines.push(`- Earn ${a.credits_on_completion ?? ''} bonus credits by POSTing answers to ${a.endpoint ?? ''}`);
-        if (Array.isArray(a.questions)) {
-          a.questions.forEach((q: string, i: number) => lines.push(`    ${i + 1}. ${q}`));
-        }
+        lines.push(`bonus_credits endpoint=${a.endpoint ?? ''}`);
       }
     }
   }
@@ -1485,23 +1481,23 @@ function listTools(): void {
   const tools = [
     {
       name: "deepseek_search",
-      description: "MUST use for live web info. Prefer semantic page description over keywords; default basic depth (1 credit; advanced=2). URLs→deepseek_extract; deep reports→deepseek_research. Thin snippets→extract best URLs."
+      description: "Live web search. query required. search_depth basic(1 credit,default)|advanced(2). For URLs use deepseek_extract; deep report use deepseek_research."
     },
     {
       name: "deepseek_extract",
-      description: "Extract full page content from URLs (batch OK). Use after search when snippets are thin. Do NOT use deepseek_search for URL extraction."
+      description: "Extract page content from URLs. After search when snippets thin."
     },
     {
       name: "deepseek_crawl",
-      description: "Crawl a site for page content (async, ~5 min). For URL list only, use deepseek_map."
+      description: "Crawl site for page content (async, ~5 min wall). URL list only → deepseek_map."
     },
     {
       name: "deepseek_map",
-      description: "List a site's URLs from a base URL. For page content use deepseek_crawl or deepseek_extract."
+      description: "List site URLs from base URL. Content → deepseek_crawl or deepseek_extract."
     },
     {
       name: "deepseek_research",
-      description: "Depth research report（主代理先广后深：5–10 次 basic search + 综合报告，成本封顶 10 点）。For a quick query use deepseek_search."
+      description: "Multi-step research report (capped cost). Quick fact → deepseek_search."
     }
   ];
 

@@ -1,59 +1,50 @@
 ---
 name: deepseek-websearch
-description: "Use when Claude Code/Codex/etc. need live web info but native WebSearch/WebFetch is unavailable (OpenCode Go DeepSeek or similar). Triggers: search the web, look up docs online, latest version, release notes, error googling. Do NOT use on OpenCode app built-in search or official DeepSeek API native WebSearch."
+description: "Live web info when native WebSearch unavailable (OpenCode Go DeepSeek etc). Triggers: search, docs lookup, releases, errors."
 ---
 
 # DeepSeek Web Search (Tavily → Exa)
 
-## When to use
+MCP for backends without native web search (OpenCode Go DeepSeek, Claude Code text-only, etc.).
 
-Use the **`deepseek-websearch` MCP** tools when:
+## Call when
 
-- You are in **Claude Code / Codex / Gemini / Hermes** (or similar), AND
-- The model backend **cannot** call native Anthropic `WebSearch` / `WebFetch` (common with **OpenCode Go DeepSeek**), AND
-- The user needs current web information (docs, errors, releases, news)
+- Backend lacks native `WebSearch` / `WebFetch`
+- User needs current web info (docs, versions, errors, news)
+- Search snippets too thin → follow with `deepseek_extract`
+- Whole-site URL inventory or crawl needed
 
-## When NOT to use
+## Do not call when
 
-- **OpenCode app**: use its built-in websearch
-- **Official DeepSeek API** in Claude Code: use native WebSearch
-- Purely local / codebase questions that do not need the internet
+- OpenCode app built-in websearch
+- Official DeepSeek API with native WebSearch in Claude Code
+- Purely local / codebase questions
+- User gave URLs only → `deepseek_extract`, not search
 
 ## Tool picker
 
 | Need | Tool |
 |------|------|
 | Live news / facts / time-sensitive info | `deepseek_search` |
-| Content of specific user-provided URLs | `deepseek_extract` |
-| Crawl a whole site (async job + polling, ~5 min) | `deepseek_crawl` |
+| Content of specific URLs | `deepseek_extract` |
+| Crawl a whole site (async, ~5 min) | `deepseek_crawl` |
 | List a site's URLs / sitemap | `deepseek_map` |
 | Deep multi-source research report | `deepseek_research` |
 | Raw content of a single known URL | `web_fetch` (if available) |
 
-## How
+## Constraints
 
-1. Pick the matching tool above; `deepseek_search` is the default for any live-info query.
-2. Prefer **semantic queries** (describe the ideal page), not bare keywords. Prefer `search_depth=basic` (1 credit); use `advanced` only for precise facts (2 credits). If snippets are thin, call `deepseek_extract` on the best URLs.
-3. Cite returned URLs in your answer.
-4. Search keys are selected by **weighted round-robin** across Tavily/Exa pools (multi-key); failures retry other keys in-pool. extract/crawl/map use Tavily only.
-5. Never answer time-sensitive queries from memory.
+- Semantic query (describe ideal page), not bare keywords
+- `search_depth`: basic default (1 credit); advanced for precise facts (2)
+- Thin snippets → `deepseek_extract` on best URLs; cite returned URLs
+- Keys: weighted round-robin Tavily/Exa pools; extract/crawl/map Tavily only
 
-## Environment rules installation
+## Persistent rules (optional)
 
-This skill serves DeepSeek-backend environments. To keep the rules active in every session (not only when this skill triggers), install them into the project file:
+If the project needs always-on rules, append to `AGENTS.md` under `## DeepSeek WebSearch rules`:
 
-1. Check whether the project's `AGENTS.md` / `CLAUDE.md` already covers these rules:
-   - the exact marker `## DeepSeek WebSearch rules` is present, OR
-   - an equivalent rule exists (e.g. it states the backend has no native web search and names `deepseek_search` / `deepseek_extract` as the tools to use)
-2. If already covered → do nothing (idempotent).
-3. If NOT covered → ask the user for confirmation, then append the following block:
-
-```markdown
-## DeepSeek WebSearch rules (active when `deepseek-websearch` MCP is in the tool list)
-
-DeepSeek-backend environment: there is NO native web search. Even if a native WebSearch/WebFetch appears in the tool list, calling it hangs the conversation — never use it.
-- Live info / news / facts / time-sensitive queries → `deepseek_search`
-- Content of specific user-provided URLs → `deepseek_extract`
-- Whole-site crawl → `deepseek_crawl`; list a site's URLs → `deepseek_map`
-- Deep multi-source research reports → `deepseek_research`
-```
+- DeepSeek-backend env: no native web search; do not call native WebSearch/WebFetch
+- Live info → `deepseek_search`
+- User URLs → `deepseek_extract`
+- Site crawl → `deepseek_crawl`; URL list → `deepseek_map`
+- Deep report → `deepseek_research`
