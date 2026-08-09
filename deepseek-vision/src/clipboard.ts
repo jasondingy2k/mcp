@@ -2,7 +2,7 @@
 // darwin：pngpaste（本机实测 pbpaste 读图恒 0 字节，2026-08-07 决策回退）；win32：powershell.exe 单次落盘；
 // 其余平台明确暂不支持。临时文件优先项目 tmp/，回退系统临时目录。
 import { execFile } from 'child_process';
-import { chmodSync, mkdirSync, unlinkSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { randomUUID } from 'crypto';
@@ -140,6 +140,11 @@ export async function persistClipboard(
   try {
     if (platform === 'darwin') await execDarwin(out); // pngpaste 单次落盘
     else await execWin(out); // PowerShell 单次落盘
+    if (!existsSync(out) || statSync(out).size <= 0) {
+      throw new ClipboardError(
+        'No valid image file from clipboard (empty or missing)（卡在 剪贴板读取）'
+      );
+    }
     try {
       chmodSync(out, 0o600);
     } catch {

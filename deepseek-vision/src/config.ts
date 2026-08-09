@@ -9,12 +9,23 @@ export const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 export const DEFAULT_MAX_IMAGE_PIXELS = 40_000_000;
 /** sharp 全量解码超时（ms） */
 export const DEFAULT_VERIFY_IMAGE_TIMEOUT_MS = 15_000;
+/** 送模前最长边缩放上限（像素）；0 表示禁用 */
+export const DEFAULT_MAX_SEND_EDGE = 2048;
 /** 单次 analyze（含空 content 重试）总墙钟预算 */
 export const ANALYZE_TOTAL_TIMEOUT_MS = 120_000;
 /** 空 content 重试时 max_tokens 钳制基准；首次已 ≥ 此值则第二次只翻倍、不再向下钳 */
 export const RETRY_MAX_TOKENS_CAP = 8192;
 
-export const ALLOWED_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+export const ALLOWED_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.heic',
+  '.heif',
+]);
 /** 简单魔数前缀；WebP 需 RIFF + 偏移 8 的 WEBP，见 validateMagic */
 export const IMAGE_MAGIC_PREFIXES: Buffer[] = [
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), // PNG
@@ -72,6 +83,18 @@ export function parseVerifyImageTimeoutMs(raw: string | undefined): number {
 }
 export function verifyImageTimeoutMs(): number {
   return parseVerifyImageTimeoutMs(process.env.VISION_VERIFY_TIMEOUT_MS);
+}
+
+export function parseMaxSendEdge(raw: string | undefined): number {
+  if (!raw) return DEFAULT_MAX_SEND_EDGE;
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n)) return DEFAULT_MAX_SEND_EDGE;
+  if (n === 0) return 0;
+  if (n < 0) return DEFAULT_MAX_SEND_EDGE;
+  return Math.max(256, n);
+}
+export function maxSendEdge(): number {
+  return parseMaxSendEdge(process.env.VISION_MAX_SEND_EDGE);
 }
 
 /** 空 content 重试用的 max_tokens：翻倍；仅当 base < CAP 时钳到 CAP，避免 VISION_MAX_TOKENS>CAP 时第二次反而变小 */

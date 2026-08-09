@@ -22,14 +22,32 @@ import {
   validateImagePath,
   validateMagic,
   verifyImage,
-  mimeSubtypeFromMagic,
+  prepareImageForModel,
+  loadImageBufferFromBase64,
+  ensureRasterImage,
+  parseRegion,
+  applyRegion,
+  type ImageRegion,
 } from './image.js';
 import { extractReasoning } from './reasoning.js';
 import { saveClipboardImage } from './clipboard.js';
-import { buildTools, PROMPTS } from './tools.js';
+import { saveScreenshotImage } from './screenshot.js';
+import {
+  applyFormat,
+  applyLang,
+  buildTools,
+  parseToolJson,
+  PROMPTS,
+  type VisionFormat,
+  type VisionLang,
+} from './tools.js';
 
 const SERVER_NAME = 'deepseek-vision';
-const SERVER_VERSION = '0.3.0';
+const SERVER_VERSION = '0.3.8';
+const FORMAT_SUPPORTED_TOOLS = new Set(['describe_ui', 'diagnose_error']);
+type ImageSource = 'clipboard' | 'path' | 'screenshot' | 'base64';
+
+const VALID_SOURCES: ImageSource[] = ['clipboard', 'path', 'screenshot', 'base64'];
 // keyless：有意不以 isError 返回，便于 agent 把设置指引转述给用户（配置提示，非工具执行失败）。
 const KEYLESS_GUIDANCE =
   '❌ OPENCODE_API_KEY is not set.\n\n' +
@@ -39,6 +57,62 @@ const KEYLESS_GUIDANCE =
 // ---- 静默日志 + 错误前缀 ----
 export const toolError = makeToolError('deepseek-vision');
 export const log = makeLogger('deepseek-vision', 'DEEPSEEK_VISION_LOG_LEVEL');
+
+export async function prepareVisionPayload(
+  data: Buffer,
+  region?: ImageRegion
+): Promise<{ mime: string; b64: string }> {
+  data = await ensureRasterImage(data);
+  validateMagic(data);
+  await verifyImage(data);
+  if (region !== undefined) {
+    data = await applyRegion(data, region);
+  }
+
+  const prepared = await prepareImageForModel(data);
+  return {
+    mime: prepared.mime,
+    b64: prepared.buffer.toString('base64'),
+  };
+}
+
+async function loadSourceBuffer(
+  source: ImageSource,
+  args: { image_path?: string; image_base64?: string }
+): Promise<Buffer> {
+  if (source === 'clipboard') {
+    const path = await saveClipboardImage();
+    try {
+      return await readFile(validateImagePath(path));
+    } finally {
+      try {
+        await unlink(path);
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+  if (source === 'screenshot') {
+    const path = await saveScreenshotImage();
+    try {
+      return await readFile(validateImagePath(path));
+    } finally {
+      try {
+        await unlink(path);
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+  if (source === 'base64') {
+    return loadImageBufferFromBase64(args.image_base64!);
+  }
+  return readFile(validateImagePath(args.image_path!));
+}
+
+function isValidSource(value: unknown): value is ImageSource {
+  return VALID_SOURCES.includes(value as ImageSource);
+}
 
 export class VisionClient {
   private client: OpenAI;
@@ -56,20 +130,32 @@ export class VisionClient {
     });
   }
 
-  async analyze(imagePath: string, prompt: string): Promise<string> {
-    const p = validateImagePath(imagePath);
-    const data = await readFile(p);
-    validateMagic(data);
-    await verifyImage(data);
+  async analyzeData(data: Buffer, prompt: string, region?: ImageRegion): Promise<string> {
+    const payload = await prepareVisionPayload(data, region);
+    return this.chatWithImages([payload], prompt);
+  }
 
-    const mime = mimeSubtypeFromMagic(data);
-    const b64 = data.toString('base64');
+  async analyzeCompare(
+    payloadA: { mime: string; b64: string },
+    payloadB: { mime: string; b64: string },
+    prompt: string
+  ): Promise<string> {
+    const text = `Image A is the first image; Image B is the second.\n\n${prompt}`;
+    return this.chatWithImages([payloadA, payloadB], text);
+  }
 
+  private async chatWithImages(
+    images: Array<{ mime: string; b64: string }>,
+    prompt: string
+  ): Promise<string> {
     const messages = [
       {
         role: 'user' as const,
         content: [
-          { type: 'image_url' as const, image_url: { url: `data:image/${mime};base64,${b64}` } },
+          ...images.map(({ mime, b64 }) => ({
+            type: 'image_url' as const,
+            image_url: { url: `data:image/${mime};base64,${b64}` },
+          })),
           { type: 'text' as const, text: prompt },
         ],
       },
@@ -147,26 +233,75 @@ export class VisionClient {
     }
     throw new Error('模型未返回正文'); // unreachable
   }
+
+  async analyze(imagePath: string, prompt: string, region?: ImageRegion): Promise<string> {
+    const p = validateImagePath(imagePath);
+    const data = await readFile(p);
+    return this.analyzeData(data, prompt, region);
+  }
+}
+
+function applyFormatPostProcess(
+  text: string,
+  promptKey: string,
+  format?: VisionFormat
+): string {
+  if (format === 'json' && FORMAT_SUPPORTED_TOOLS.has(promptKey)) {
+    return parseToolJson(text, promptKey as 'diagnose_error' | 'describe_ui');
+  }
+  return text;
+}
+
+function buildPrompt(
+  promptKey: string,
+  override?: string,
+  lang?: VisionLang,
+  format?: VisionFormat
+): string {
+  const base = override ?? PROMPTS[promptKey];
+  return applyLang(applyFormat(base, format, promptKey), lang, promptKey, format);
 }
 
 async function runImage(
   client: VisionClient,
   promptKey: string,
   imagePath: string,
-  override?: string
+  override?: string,
+  lang?: VisionLang,
+  format?: VisionFormat,
+  region?: ImageRegion
 ): Promise<string> {
-  const prompt = override || PROMPTS[promptKey];
-  return client.analyze(imagePath, prompt);
+  const prompt = buildPrompt(promptKey, override, lang, format);
+  const text = await client.analyze(imagePath, prompt, region);
+  return applyFormatPostProcess(text, promptKey, format);
+}
+
+async function runBase64(
+  client: VisionClient,
+  promptKey: string,
+  imageBase64: string,
+  override?: string,
+  lang?: VisionLang,
+  format?: VisionFormat,
+  region?: ImageRegion
+): Promise<string> {
+  const prompt = buildPrompt(promptKey, override, lang, format);
+  const data = loadImageBufferFromBase64(imageBase64);
+  const text = await client.analyzeData(data, prompt, region);
+  return applyFormatPostProcess(text, promptKey, format);
 }
 
 async function runClipboard(
   client: VisionClient,
   promptKey: string,
-  override?: string
+  override?: string,
+  lang?: VisionLang,
+  format?: VisionFormat,
+  region?: ImageRegion
 ): Promise<string> {
   const path = await saveClipboardImage();
   try {
-    return await runImage(client, promptKey, path, override);
+    return await runImage(client, promptKey, path, override, lang, format, region);
   } finally {
     try {
       await unlink(path); // 用完删除临时文件
@@ -174,6 +309,177 @@ async function runClipboard(
       /* 忽略 */
     }
   }
+}
+
+async function runScreenshot(
+  client: VisionClient,
+  promptKey: string,
+  override?: string,
+  lang?: VisionLang,
+  format?: VisionFormat,
+  region?: ImageRegion
+): Promise<string> {
+  const path = await saveScreenshotImage();
+  try {
+    return await runImage(client, promptKey, path, override, lang, format, region);
+  } finally {
+    try {
+      await unlink(path);
+    } catch {
+      /* 忽略 */
+    }
+  }
+}
+
+async function runCompareImages(
+  client: VisionClient,
+  args: Record<string, unknown>
+): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+  if (args.lang !== undefined) {
+    if (args.lang !== 'zh' && args.lang !== 'en') {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: toolError(
+              'ValidationError',
+              `lang must be "zh" or "en", got: ${JSON.stringify(args.lang)}`
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+  const lang = args.lang as VisionLang | undefined;
+
+  let regionA: ImageRegion | undefined;
+  if (args.region_a !== undefined) {
+    try {
+      regionA = parseRegion(args.region_a);
+    } catch (e) {
+      const type = e instanceof Error ? e.name : 'Error';
+      const message = e instanceof Error ? e.message : String(e);
+      return { content: [{ type: 'text', text: toolError(type, message) }], isError: true };
+    }
+  }
+
+  let regionB: ImageRegion | undefined;
+  if (args.region_b !== undefined) {
+    try {
+      regionB = parseRegion(args.region_b);
+    } catch (e) {
+      const type = e instanceof Error ? e.name : 'Error';
+      const message = e instanceof Error ? e.message : String(e);
+      return { content: [{ type: 'text', text: toolError(type, message) }], isError: true };
+    }
+  }
+
+  for (const [field, suffix] of [
+    ['source_a', 'a'],
+    ['source_b', 'b'],
+  ] as const) {
+    const source = args[field];
+    if (!isValidSource(source)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: toolError(
+              'ValidationError',
+              `${field} must be "clipboard", "path", "screenshot", or "base64", got: ${JSON.stringify(source)}`
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (source === 'path') {
+      const pathKey = `image_path_${suffix}`;
+      if (!args[pathKey]) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: toolError(
+                'ValidationError',
+                `${pathKey} is required when ${field}=path`
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (typeof args[pathKey] !== 'string') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: toolError(
+                'ValidationError',
+                `${pathKey} must be a string, got ${typeof args[pathKey]}`
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+    if (source === 'base64') {
+      const b64Key = `image_base64_${suffix}`;
+      if (!args[b64Key]) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: toolError(
+                'ValidationError',
+                `${b64Key} is required when ${field}=base64`
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (typeof args[b64Key] !== 'string') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: toolError(
+                'ValidationError',
+                `${b64Key} must be a string, got ${typeof args[b64Key]}`
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  }
+
+  const override = typeof args.prompt === 'string' ? args.prompt : undefined;
+  const prompt = applyLang(
+    override ?? PROMPTS.compare,
+    lang,
+    'compare'
+  );
+
+  const sourceA = args.source_a as ImageSource;
+  const sourceB = args.source_b as ImageSource;
+  const dataA = await loadSourceBuffer(sourceA, {
+    image_path: args.image_path_a as string | undefined,
+    image_base64: args.image_base64_a as string | undefined,
+  });
+  const dataB = await loadSourceBuffer(sourceB, {
+    image_path: args.image_path_b as string | undefined,
+    image_base64: args.image_base64_b as string | undefined,
+  });
+
+  const payloadA = await prepareVisionPayload(dataA, regionA);
+  const payloadB = await prepareVisionPayload(dataB, regionB);
+  const text = await client.analyzeCompare(payloadA, payloadB, prompt);
+  return { content: [{ type: 'text', text }] };
 }
 
 export function createServer(visionClient: VisionClient | null): Server {
@@ -201,6 +507,7 @@ export function createServer(visionClient: VisionClient | null): Server {
         understand_diagram: 'understand_diagram',
         analyze_chart: 'analyze_chart',
         code_from_screenshot: 'code_from_screenshot',
+        compare_images: 'compare',
       };
       const promptKey = promptKeyByTool[name];
       if (!promptKey) {
@@ -215,15 +522,85 @@ export function createServer(visionClient: VisionClient | null): Server {
         };
       }
 
+      if (name === 'compare_images') {
+        return await runCompareImages(visionClient, args);
+      }
+
+      let lang: VisionLang | undefined;
+      if (args.lang !== undefined) {
+        if (args.lang !== 'zh' && args.lang !== 'en') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: toolError(
+                  'ValidationError',
+                  `lang must be "zh" or "en", got: ${JSON.stringify(args.lang)}`
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        lang = args.lang;
+      }
+
+      let format: VisionFormat | undefined;
+      if (args.format !== undefined) {
+        if (args.format !== 'text' && args.format !== 'json') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: toolError(
+                  'ValidationError',
+                  `format must be "text" or "json", got: ${JSON.stringify(args.format)}`
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (!FORMAT_SUPPORTED_TOOLS.has(name)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: toolError(
+                  'ValidationError',
+                  'format is only supported on diagnose_error and describe_ui'
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        format = args.format;
+      }
+
+      let region: ImageRegion | undefined;
+      if (args.region !== undefined) {
+        try {
+          region = parseRegion(args.region);
+        } catch (e) {
+          const type = e instanceof Error ? e.name : 'Error';
+          const message = e instanceof Error ? e.message : String(e);
+          return {
+            content: [{ type: 'text', text: toolError(type, message) }],
+            isError: true,
+          };
+        }
+      }
+
       const source = args.source;
-      if (source !== 'clipboard' && source !== 'path') {
+      if (!isValidSource(source)) {
         return {
           content: [
             {
               type: 'text',
               text: toolError(
                 'ValidationError',
-                `source must be "clipboard" or "path", got: ${JSON.stringify(source)}`
+                `source must be "clipboard", "path", "screenshot", or "base64", got: ${JSON.stringify(source)}`
               ),
             },
           ],
@@ -237,7 +614,47 @@ export function createServer(visionClient: VisionClient | null): Server {
           : undefined;
       let text: string;
       if (source === 'clipboard') {
-        text = await runClipboard(visionClient, promptKey, override);
+        text = await runClipboard(visionClient, promptKey, override, lang, format, region);
+      } else if (source === 'screenshot') {
+        text = await runScreenshot(visionClient, promptKey, override, lang, format, region);
+      } else if (source === 'base64') {
+        if (!args.image_base64) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: toolError(
+                  'ValidationError',
+                  'image_base64 is required when source=base64'
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (typeof args.image_base64 !== 'string') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: toolError(
+                  'ValidationError',
+                  `image_base64 must be a string, got ${typeof args.image_base64}`
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        text = await runBase64(
+          visionClient,
+          promptKey,
+          args.image_base64,
+          override,
+          lang,
+          format,
+          region
+        );
       } else {
         if (!args.image_path) {
           return {
@@ -271,7 +688,10 @@ export function createServer(visionClient: VisionClient | null): Server {
           visionClient,
           promptKey,
           args.image_path,
-          override
+          override,
+          lang,
+          format,
+          region
         );
       }
       return { content: [{ type: 'text', text }] };
