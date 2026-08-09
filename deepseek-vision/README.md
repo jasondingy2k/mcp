@@ -2,7 +2,7 @@
 
 迁移自 `mimo-vision-mcp`（Python）的 TS 版：剪贴板优先的视觉 MCP，为 DeepSeek 系纯文本 agent 提供看图能力，模型走 OpenCode Go `mimo-v2.5`。
 
-## 功能（2 个工具，v0.4.2）
+## 功能（2 个工具，v0.4.3）
 
 | 工具 | 说明 |
 |---|---|

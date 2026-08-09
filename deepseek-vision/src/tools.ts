@@ -198,7 +198,7 @@ const sourceProps = {
       unit: {
         type: 'string',
         enum: ['px', 'ratio'],
-        description: 'px | ratio.',
+        description: 'px=raster pixels post-HEIC; ratio=[0,1] of width/height.',
       },
     },
     required: ['x', 'y', 'width', 'height', 'unit'],
@@ -222,7 +222,7 @@ const regionSchema = {
     unit: {
       type: 'string',
       enum: ['px', 'ratio'],
-      description: 'px | ratio.',
+      description: 'px=raster pixels post-HEIC; ratio=[0,1] of width/height.',
     },
   },
   required: ['x', 'y', 'width', 'height', 'unit'],
@@ -239,7 +239,8 @@ function deepseekVisionTool(): Tool {
         capability: {
           type: 'string',
           enum: [...VISION_CAPABILITIES],
-          description: 'Vision task.',
+          description:
+            'analyze|extract_text(OCR)|describe_ui|diagnose_error|understand_diagram|analyze_chart|code_from_screenshot.',
         },
         ...sourceProps,
         prompt: {

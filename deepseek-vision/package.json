@@ -1,6 +1,6 @@
 {
   "name": "deepseek-vision",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Clipboard-first vision MCP (OpenCode Go MiMo-V2.5) for DeepSeek-based text-only agents",
   "type": "module",
   "bin": {

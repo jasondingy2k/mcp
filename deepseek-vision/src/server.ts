@@ -45,7 +45,7 @@ import {
 } from './tools.js';
 
 const SERVER_NAME = 'deepseek-vision';
-const SERVER_VERSION = '0.4.2';
+const SERVER_VERSION = '0.4.3';
 const FORMAT_SUPPORTED_CAPABILITIES = new Set<VisionCapability>(['describe_ui', 'diagnose_error']);
 const VALID_CAPABILITIES = new Set<string>(VISION_CAPABILITIES);
 type ImageSource = 'clipboard' | 'path' | 'screenshot' | 'base64';
@@ -225,11 +225,11 @@ export class VisionClient {
 
       if (finishReason === 'length') {
         throw new Error(
-          `模型输出被截断（finish_reason=length，reasoning 占满 token 配额），已自动重试并加倍 max_tokens 仍为空。increase VISION_MAX_TOKENS and retry${reasoningHint}`
+          `empty content after retry (finish_reason=length). increase VISION_MAX_TOKENS and retry${reasoningHint}`
         );
       }
       throw new Error(
-        `模型未返回正文（finish_reason=${finishReason}），已自动重试 1 次仍为空。${reasoningHint}`
+        `empty content after retry (finish_reason=${finishReason})${reasoningHint}`
       );
     }
     throw new Error('模型未返回正文'); // unreachable
