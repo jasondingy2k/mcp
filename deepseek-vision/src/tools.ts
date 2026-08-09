@@ -1,12 +1,23 @@
-// tools.ts — 8 个工具注册 + 8 个 PROMPTS（能力=工具名，来源=source 参数）
+// tools.ts — 2 工具注册（deepseek_vision + compare_images）+ PROMPTS（capability key）
 // 描述/指令统一英文（面向 agent，简洁）。
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 export type VisionLang = 'zh' | 'en';
 export type VisionFormat = 'text' | 'json';
 
+export const VISION_CAPABILITIES = [
+  'analyze',
+  'extract_text',
+  'describe_ui',
+  'diagnose_error',
+  'understand_diagram',
+  'analyze_chart',
+  'code_from_screenshot',
+] as const;
+
+export type VisionCapability = (typeof VISION_CAPABILITIES)[number];
+
 const KEEP_SOURCE_KEYS = new Set(['extract_text', 'code_from_screenshot']);
-const JSON_FORMAT_KEYS = new Set(['diagnose_error', 'describe_ui']);
 
 export function applyFormat(
   prompt: string,
@@ -161,38 +172,33 @@ const sourceProps = {
   source: {
     type: 'string' as const,
     enum: ['clipboard', 'path', 'screenshot', 'base64'],
-    description:
-      'Image source: clipboard, file path, full-screen screenshot, or inline base64.',
+    description: 'clipboard | path | screenshot | base64.',
   },
   image_path: {
     type: 'string' as const,
-    description: 'Absolute path to the image file (required when source=path).',
+    description: 'Required when source=path.',
   },
   image_base64: {
     type: 'string' as const,
-    description:
-      'Raw base64 or data URL (data:image/<subtype>;base64,<payload>); required when source=base64.',
+    description: 'Raw base64 or data URL; required when source=base64.',
   },
   lang: {
     type: 'string' as const,
     enum: ['zh', 'en'],
-    description:
-      'Optional response language: zh (Simplified Chinese) or en. Omit to keep default prompts. For OCR/code tools, image text/code stay untranslated.',
+    description: 'Optional zh|en. OCR/code: image text untranslated.',
   },
   region: {
     type: 'object' as const,
-    description:
-      'Optional crop region applied after rasterization (HEIC transcode) and before downscale. Use to focus on a toast, code block, or UI corner.',
+    description: 'Optional crop after HEIC transcode, before downscale.',
     properties: {
-      x: { type: 'number', description: 'Left edge of the crop rectangle.' },
-      y: { type: 'number', description: 'Top edge of the crop rectangle.' },
-      width: { type: 'number', description: 'Crop width (> 0).' },
-      height: { type: 'number', description: 'Crop height (> 0).' },
+      x: { type: 'number', description: 'Left.' },
+      y: { type: 'number', description: 'Top.' },
+      width: { type: 'number', description: 'Width (>0).' },
+      height: { type: 'number', description: 'Height (>0).' },
       unit: {
         type: 'string',
         enum: ['px', 'ratio'],
-        description:
-          'Coordinate unit: px = pixels on the current raster image; ratio = normalized [0,1] fractions (width is fraction of image width).',
+        description: 'px | ratio.',
       },
     },
     required: ['x', 'y', 'width', 'height', 'unit'],
@@ -202,84 +208,101 @@ const sourceProps = {
 const formatProp = {
   type: 'string' as const,
   enum: ['text', 'json'],
-  description:
-    'Optional response format: text (prose, default) or json (structured fields). Only supported on describe_ui and diagnose_error.',
+  description: 'text|json. Only when capability is describe_ui or diagnose_error.',
 };
 
 const regionSchema = {
   type: 'object' as const,
-  description:
-    'Optional crop region applied after rasterization (HEIC transcode) and before downscale. Use to focus on a toast, code block, or UI corner.',
+  description: 'Optional crop after HEIC transcode, before downscale.',
   properties: {
-    x: { type: 'number', description: 'Left edge of the crop rectangle.' },
-    y: { type: 'number', description: 'Top edge of the crop rectangle.' },
-    width: { type: 'number', description: 'Crop width (> 0).' },
-    height: { type: 'number', description: 'Crop height (> 0).' },
+    x: { type: 'number', description: 'Left.' },
+    y: { type: 'number', description: 'Top.' },
+    width: { type: 'number', description: 'Width (>0).' },
+    height: { type: 'number', description: 'Height (>0).' },
     unit: {
       type: 'string',
       enum: ['px', 'ratio'],
-      description:
-        'Coordinate unit: px = pixels on the current raster image; ratio = normalized [0,1] fractions (width is fraction of image width).',
+      description: 'px | ratio.',
     },
   },
   required: ['x', 'y', 'width', 'height', 'unit'],
 };
 
+function deepseekVisionTool(): Tool {
+  return {
+    name: 'deepseek_vision',
+    description:
+      'Single-image vision. Args: capability, source; image_path if path; image_base64 if base64. Optional: lang, region; prompt if capability=analyze; format if describe_ui|diagnose_error.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        capability: {
+          type: 'string',
+          enum: [...VISION_CAPABILITIES],
+          description: 'Vision task.',
+        },
+        ...sourceProps,
+        prompt: {
+          type: 'string',
+          description: 'Custom question; only when capability=analyze.',
+        },
+        format: formatProp,
+      },
+      required: ['capability', 'source'],
+    },
+  };
+}
+
 function compareImagesTool(): Tool {
   return {
     name: 'compare_images',
     description:
-      'Compare two images side by side (A=first, B=second): before/after UI, bug fixes, layout changes. Each side uses its own source (clipboard|path|screenshot|base64). For true before/after, prefer path or base64 — consecutive clipboard reads may return the same image.',
+      'Compare image A then B. source_a/source_b (+ path/base64 fields). Optional: prompt, lang, region_a/region_b. Prefer path|base64 for distinct before/after (clipboard may repeat).',
     inputSchema: {
       type: 'object',
       properties: {
         source_a: {
           type: 'string',
           enum: ['clipboard', 'path', 'screenshot', 'base64'],
-          description: 'Image A (first) source.',
+          description: 'Image A source.',
         },
         source_b: {
           type: 'string',
           enum: ['clipboard', 'path', 'screenshot', 'base64'],
-          description: 'Image B (second) source.',
+          description: 'Image B source.',
         },
         image_path_a: {
           type: 'string',
-          description: 'Absolute path to image A (required when source_a=path).',
+          description: 'Required when source_a=path.',
         },
         image_path_b: {
           type: 'string',
-          description: 'Absolute path to image B (required when source_b=path).',
+          description: 'Required when source_b=path.',
         },
         image_base64_a: {
           type: 'string',
-          description:
-            'Raw base64 or data URL for image A; required when source_a=base64.',
+          description: 'Required when source_a=base64.',
         },
         image_base64_b: {
           type: 'string',
-          description:
-            'Raw base64 or data URL for image B; required when source_b=base64.',
+          description: 'Required when source_b=base64.',
         },
         prompt: {
           type: 'string',
-          description: 'Custom comparison focus (overrides the default prompt).',
+          description: 'Optional; overrides default compare prompt.',
         },
         lang: {
           type: 'string',
           enum: ['zh', 'en'],
-          description:
-            'Optional response language: zh (Simplified Chinese) or en. Omit to keep default prompts.',
+          description: 'Optional zh|en.',
         },
         region_a: {
           ...regionSchema,
-          description:
-            'Optional crop region for image A (same structure as single-image region).',
+          description: 'Optional crop for image A.',
         },
         region_b: {
           ...regionSchema,
-          description:
-            'Optional crop region for image B (same structure as single-image region).',
+          description: 'Optional crop for image B.',
         },
       },
       required: ['source_a', 'source_b'],
@@ -287,65 +310,6 @@ function compareImagesTool(): Tool {
   };
 }
 
-function capabilityTool(
-  name: string,
-  en: string,
-  opts?: { withPrompt?: boolean; withFormat?: boolean }
-): Tool {
-  const properties: { [x: string]: object } = { ...sourceProps };
-  if (opts?.withPrompt) {
-    properties.prompt = {
-      type: 'string',
-      description: 'Custom question (overrides the default prompt).',
-    };
-  }
-  if (opts?.withFormat) {
-    properties.format = formatProp;
-  }
-  return {
-    name,
-    description: en,
-    inputSchema: {
-      type: 'object',
-      properties,
-      required: ['source'],
-    },
-  };
-}
-
 export function buildTools(): Tool[] {
-  return [
-    capabilityTool(
-      'analyze_image',
-      'Describe an image (generic analysis). Optional `prompt` for a custom question. Set source=clipboard, source=path, source=screenshot, or source=base64.',
-      { withPrompt: true }
-    ),
-    capabilityTool(
-      'extract_text',
-      'OCR an image and return all text. Set source=clipboard, source=path, source=screenshot, or source=base64.'
-    ),
-    capabilityTool(
-      'describe_ui',
-      'Analyze a UI screenshot: layout, components, text, state. Set source=clipboard, source=path, source=screenshot, or source=base64. Optional format=json for structured output.',
-      { withFormat: true }
-    ),
-    capabilityTool(
-      'diagnose_error',
-      'Diagnose an error screenshot: exact error, causes, fix steps. Set source=clipboard, source=path, source=screenshot, or source=base64. Optional format=json for structured output.',
-      { withFormat: true }
-    ),
-    capabilityTool(
-      'understand_diagram',
-      'Interpret a diagram (flowchart, architecture, sequence). Set source=clipboard, source=path, source=screenshot, or source=base64.'
-    ),
-    capabilityTool(
-      'analyze_chart',
-      'Analyze a data chart (line/bar/pie): type, axes, trends, insights. Set source=clipboard, source=path, source=screenshot, or source=base64.'
-    ),
-    capabilityTool(
-      'code_from_screenshot',
-      'Extract editable code from a screenshot. Set source=clipboard, source=path, source=screenshot, or source=base64.'
-    ),
-    compareImagesTool(),
-  ];
+  return [deepseekVisionTool(), compareImagesTool()];
 }

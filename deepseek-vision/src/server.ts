@@ -38,21 +38,22 @@ import {
   buildTools,
   parseToolJson,
   PROMPTS,
+  VISION_CAPABILITIES,
+  type VisionCapability,
   type VisionFormat,
   type VisionLang,
 } from './tools.js';
 
 const SERVER_NAME = 'deepseek-vision';
-const SERVER_VERSION = '0.3.8';
-const FORMAT_SUPPORTED_TOOLS = new Set(['describe_ui', 'diagnose_error']);
+const SERVER_VERSION = '0.4.2';
+const FORMAT_SUPPORTED_CAPABILITIES = new Set<VisionCapability>(['describe_ui', 'diagnose_error']);
+const VALID_CAPABILITIES = new Set<string>(VISION_CAPABILITIES);
 type ImageSource = 'clipboard' | 'path' | 'screenshot' | 'base64';
 
 const VALID_SOURCES: ImageSource[] = ['clipboard', 'path', 'screenshot', 'base64'];
 // keyless：有意不以 isError 返回，便于 agent 把设置指引转述给用户（配置提示，非工具执行失败）。
 const KEYLESS_GUIDANCE =
-  '❌ OPENCODE_API_KEY is not set.\n\n' +
-  '1. Open https://opencode.ai/auth and copy an API Key\n' +
-  '2. Set OPENCODE_API_KEY in the env of this MCP server (CC Switch).';
+  'OPENCODE_API_KEY unset. Set OPENCODE_API_KEY (or VISION_API_KEY) in MCP server env.';
 
 // ---- 静默日志 + 错误前缀 ----
 export const toolError = makeToolError('deepseek-vision');
@@ -224,7 +225,7 @@ export class VisionClient {
 
       if (finishReason === 'length') {
         throw new Error(
-          `模型输出被截断（finish_reason=length，reasoning 占满 token 配额），已自动重试并加倍 max_tokens 仍为空。请增大 VISION_MAX_TOKENS 后重试。${reasoningHint}`
+          `模型输出被截断（finish_reason=length，reasoning 占满 token 配额），已自动重试并加倍 max_tokens 仍为空。increase VISION_MAX_TOKENS and retry${reasoningHint}`
         );
       }
       throw new Error(
@@ -246,10 +247,152 @@ function applyFormatPostProcess(
   promptKey: string,
   format?: VisionFormat
 ): string {
-  if (format === 'json' && FORMAT_SUPPORTED_TOOLS.has(promptKey)) {
+  if (format === 'json' && FORMAT_SUPPORTED_CAPABILITIES.has(promptKey as VisionCapability)) {
     return parseToolJson(text, promptKey as 'diagnose_error' | 'describe_ui');
   }
   return text;
+}
+
+function validationError(message: string): {
+  content: Array<{ type: string; text: string }>;
+  isError: true;
+} {
+  return {
+    content: [{ type: 'text', text: toolError('ValidationError', message) }],
+    isError: true,
+  };
+}
+
+function resolveCapability(
+  toolName: string,
+  args: Record<string, unknown>
+):
+  | { ok: true; capability: VisionCapability }
+  | { ok: false; response: ReturnType<typeof validationError> } {
+  if (toolName === 'deepseek_vision') {
+    const capability = args.capability;
+    if (capability === undefined || capability === null || capability === '') {
+      return {
+        ok: false,
+        response: validationError('capability is required'),
+      };
+    }
+    if (typeof capability !== 'string' || !VALID_CAPABILITIES.has(capability)) {
+      return {
+        ok: false,
+        response: validationError(
+          `capability must be one of: ${VISION_CAPABILITIES.join(', ')}, got: ${JSON.stringify(capability)}`
+        ),
+      };
+    }
+    return { ok: true, capability: capability as VisionCapability };
+  }
+
+  return {
+    ok: false,
+    response: validationError(`未知工具: ${toolName}`),
+  };
+}
+
+async function runDeepseekVision(
+  client: VisionClient,
+  capability: VisionCapability,
+  args: Record<string, unknown>
+): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+  if (args.prompt !== undefined && capability !== 'analyze') {
+    return validationError('prompt is only supported when capability=analyze');
+  }
+
+  let lang: VisionLang | undefined;
+  if (args.lang !== undefined) {
+    if (args.lang !== 'zh' && args.lang !== 'en') {
+      return validationError(
+        `lang must be "zh" or "en", got: ${JSON.stringify(args.lang)}`
+      );
+    }
+    lang = args.lang;
+  }
+
+  let format: VisionFormat | undefined;
+  if (args.format !== undefined) {
+    if (args.format !== 'text' && args.format !== 'json') {
+      return validationError(
+        `format must be "text" or "json", got: ${JSON.stringify(args.format)}`
+      );
+    }
+    if (!FORMAT_SUPPORTED_CAPABILITIES.has(capability)) {
+      return validationError(
+        'format is only supported when capability is describe_ui or diagnose_error'
+      );
+    }
+    format = args.format;
+  }
+
+  let region: ImageRegion | undefined;
+  if (args.region !== undefined) {
+    try {
+      region = parseRegion(args.region);
+    } catch (e) {
+      const type = e instanceof Error ? e.name : 'Error';
+      const message = e instanceof Error ? e.message : String(e);
+      return { content: [{ type: 'text', text: toolError(type, message) }], isError: true };
+    }
+  }
+
+  const source = args.source;
+  if (!isValidSource(source)) {
+    return validationError(
+      `source must be "clipboard", "path", "screenshot", or "base64", got: ${JSON.stringify(source)}`
+    );
+  }
+
+  const promptKey = capability;
+  const override =
+    capability === 'analyze' && typeof args.prompt === 'string' ? args.prompt : undefined;
+
+  let text: string;
+  if (source === 'clipboard') {
+    text = await runClipboard(client, promptKey, override, lang, format, region);
+  } else if (source === 'screenshot') {
+    text = await runScreenshot(client, promptKey, override, lang, format, region);
+  } else if (source === 'base64') {
+    if (!args.image_base64) {
+      return validationError('image_base64 is required when source=base64');
+    }
+    if (typeof args.image_base64 !== 'string') {
+      return validationError(
+        `image_base64 must be a string, got ${typeof args.image_base64}`
+      );
+    }
+    text = await runBase64(
+      client,
+      promptKey,
+      args.image_base64,
+      override,
+      lang,
+      format,
+      region
+    );
+  } else {
+    if (!args.image_path) {
+      return validationError('image_path is required when source=path');
+    }
+    if (typeof args.image_path !== 'string') {
+      return validationError(
+        `image_path must be a string, got ${typeof args.image_path}`
+      );
+    }
+    text = await runImage(
+      client,
+      promptKey,
+      args.image_path,
+      override,
+      lang,
+      format,
+      region
+    );
+  }
+  return { content: [{ type: 'text', text }] };
 }
 
 function buildPrompt(
@@ -499,202 +642,16 @@ export function createServer(visionClient: VisionClient | null): Server {
       const args = request.params.arguments ?? {};
       const name: string = request.params.name;
 
-      const promptKeyByTool: Record<string, string> = {
-        analyze_image: 'analyze',
-        extract_text: 'extract_text',
-        describe_ui: 'describe_ui',
-        diagnose_error: 'diagnose_error',
-        understand_diagram: 'understand_diagram',
-        analyze_chart: 'analyze_chart',
-        code_from_screenshot: 'code_from_screenshot',
-        compare_images: 'compare',
-      };
-      const promptKey = promptKeyByTool[name];
-      if (!promptKey) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: toolError('ValidationError', `未知工具: ${name}`),
-            },
-          ],
-          isError: true,
-        };
-      }
-
       if (name === 'compare_images') {
         return await runCompareImages(visionClient, args);
       }
 
-      let lang: VisionLang | undefined;
-      if (args.lang !== undefined) {
-        if (args.lang !== 'zh' && args.lang !== 'en') {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  `lang must be "zh" or "en", got: ${JSON.stringify(args.lang)}`
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        lang = args.lang;
+      const resolved = resolveCapability(name, args);
+      if (!resolved.ok) {
+        return resolved.response;
       }
 
-      let format: VisionFormat | undefined;
-      if (args.format !== undefined) {
-        if (args.format !== 'text' && args.format !== 'json') {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  `format must be "text" or "json", got: ${JSON.stringify(args.format)}`
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (!FORMAT_SUPPORTED_TOOLS.has(name)) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  'format is only supported on diagnose_error and describe_ui'
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        format = args.format;
-      }
-
-      let region: ImageRegion | undefined;
-      if (args.region !== undefined) {
-        try {
-          region = parseRegion(args.region);
-        } catch (e) {
-          const type = e instanceof Error ? e.name : 'Error';
-          const message = e instanceof Error ? e.message : String(e);
-          return {
-            content: [{ type: 'text', text: toolError(type, message) }],
-            isError: true,
-          };
-        }
-      }
-
-      const source = args.source;
-      if (!isValidSource(source)) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: toolError(
-                'ValidationError',
-                `source must be "clipboard", "path", "screenshot", or "base64", got: ${JSON.stringify(source)}`
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const override =
-        name === 'analyze_image' && typeof args.prompt === 'string'
-          ? args.prompt
-          : undefined;
-      let text: string;
-      if (source === 'clipboard') {
-        text = await runClipboard(visionClient, promptKey, override, lang, format, region);
-      } else if (source === 'screenshot') {
-        text = await runScreenshot(visionClient, promptKey, override, lang, format, region);
-      } else if (source === 'base64') {
-        if (!args.image_base64) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  'image_base64 is required when source=base64'
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (typeof args.image_base64 !== 'string') {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  `image_base64 must be a string, got ${typeof args.image_base64}`
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        text = await runBase64(
-          visionClient,
-          promptKey,
-          args.image_base64,
-          override,
-          lang,
-          format,
-          region
-        );
-      } else {
-        if (!args.image_path) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  'image_path is required when source=path'
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (typeof args.image_path !== 'string') {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: toolError(
-                  'ValidationError',
-                  `image_path must be a string, got ${typeof args.image_path}`
-                ),
-              },
-            ],
-            isError: true,
-          };
-        }
-        text = await runImage(
-          visionClient,
-          promptKey,
-          args.image_path,
-          override,
-          lang,
-          format,
-          region
-        );
-      }
-      return { content: [{ type: 'text', text }] };
+      return await runDeepseekVision(visionClient, resolved.capability, args);
     } catch (e) {
       const type = e instanceof Error ? e.name : 'Error';
       const message = e instanceof Error ? e.message : String(e);

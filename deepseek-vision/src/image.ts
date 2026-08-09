@@ -214,7 +214,7 @@ async function transcodeHeicWithSips(
     return await readFile(outPath);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    throw new ImageValidationError(`HEIC 转 PNG 失败: ${msg.slice(0, 120)}（卡在 HEIC 转码）`);
+    throw new ImageValidationError(`HEIC→PNG failed: ${msg.slice(0, 120)}（卡在 HEIC 转码）`);
   } finally {
     await Promise.allSettled([unlink(inPath), unlink(outPath)]);
   }
@@ -225,7 +225,7 @@ async function transcodeHeicWithSharp(data: Buffer): Promise<Buffer> {
     return await sharp(data).png().toBuffer();
   } catch {
     throw new ImageValidationError(
-      '当前环境无法解码 HEIC/HEIF（sharp 未编入 HEVC 编解码器）。请改为 PNG/JPEG，或在 macOS 上使用。（卡在 HEIC 转码）'
+      'HEIC decode unsupported (no HEVC); use PNG/JPEG or darwin（卡在 HEIC 转码）'
     );
   }
 }

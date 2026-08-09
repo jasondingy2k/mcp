@@ -23,17 +23,17 @@ export function parseDarwinScreenshotError(
 ): ScreenshotError | null {
   if (!error) return null;
   if (error.code === 'ENOENT') {
-    return new ScreenshotError('未找到 screencapture（应为 macOS 系统自带）。');
+    return new ScreenshotError('screencapture missing（卡在 截屏）');
   }
   const timedOut =
     (error as NodeJS.ErrnoException & { killed?: boolean }).killed === true ||
     (error as NodeJS.ErrnoException & { signal?: string }).signal === 'SIGTERM' ||
     /ETIMEDOUT|timed out/i.test(error.message ?? '');
   if (timedOut) {
-    return new ScreenshotError('截屏超时（>15s）（卡在 截屏）');
+    return new ScreenshotError('screenshot timeout (>15s)（卡在 截屏）');
   }
   if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-    return new ScreenshotError('截屏输出过大（卡在 截屏）');
+    return new ScreenshotError('screenshot output too large（卡在 截屏）');
   }
   return new ScreenshotError('Screenshot capture failed (screencapture).');
 }
@@ -76,14 +76,14 @@ export function parseWindowsScreenshotError(
 ): ScreenshotError | null {
   if (!error) return null;
   if (error.code === 'ENOENT') {
-    return new ScreenshotError('未找到 powershell.exe（应为 Windows 系统自带）。');
+    return new ScreenshotError('powershell.exe missing（卡在 截屏）');
   }
   const timedOut =
     (error as NodeJS.ErrnoException & { killed?: boolean }).killed === true ||
     (error as NodeJS.ErrnoException & { signal?: string }).signal === 'SIGTERM' ||
     /ETIMEDOUT|timed out/i.test(error.message ?? '');
   if (timedOut) {
-    return new ScreenshotError('windows screenshot: 截屏超时（>15s）（卡在 截屏）');
+    return new ScreenshotError('windows screenshot: timeout (>15s)（卡在 截屏）');
   }
   const detail = String(stderr).trim() || (error.message ?? String(error));
   return new ScreenshotError(`windows screenshot: ${detail.slice(0, 200)}`);

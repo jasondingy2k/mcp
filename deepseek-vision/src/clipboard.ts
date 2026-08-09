@@ -22,7 +22,7 @@ export class ClipboardError extends Error {
 export function parseDarwinError(error: NodeJS.ErrnoException | null): ClipboardError | null {
   if (!error) return null;
   if (error.code === 'ENOENT') {
-    return new ClipboardError('未安装 pngpaste，可执行 brew install pngpaste 后重试。');
+    return new ClipboardError('pngpaste missing（卡在 剪贴板读取）');
   }
   // execFile timeout 会设 killed=true（或 signal=SIGTERM）；勿误报「无图」
   const timedOut =
@@ -30,10 +30,10 @@ export function parseDarwinError(error: NodeJS.ErrnoException | null): Clipboard
     (error as NodeJS.ErrnoException & { signal?: string }).signal === 'SIGTERM' ||
     /ETIMEDOUT|timed out/i.test(error.message ?? '');
   if (timedOut) {
-    return new ClipboardError('剪贴板读取超时（>10s）（卡在 剪贴板读取）');
+    return new ClipboardError('clipboard read timeout (>10s)（卡在 剪贴板读取）');
   }
   if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-    return new ClipboardError('剪贴板图片过大（卡在 剪贴板读取）');
+    return new ClipboardError('clipboard image too large（卡在 剪贴板读取）');
   }
   return new ClipboardError('No image in clipboard (pngpaste failed).');
 }
@@ -73,14 +73,14 @@ export function parseWindowsClipboardError(
     return new ClipboardError('No image in clipboard');
   }
   if (error.code === 'ENOENT') {
-    return new ClipboardError('未找到 powershell.exe（应为 Windows 系统自带）。');
+    return new ClipboardError('powershell.exe missing（卡在 剪贴板读取）');
   }
   const timedOut =
     (error as NodeJS.ErrnoException & { killed?: boolean }).killed === true ||
     (error as NodeJS.ErrnoException & { signal?: string }).signal === 'SIGTERM' ||
     /ETIMEDOUT|timed out/i.test(error.message ?? '');
   if (timedOut) {
-    return new ClipboardError('windows clipboard: 读取超时（>10s）（卡在 剪贴板读取）');
+    return new ClipboardError('windows clipboard: read timeout (>10s)（卡在 剪贴板读取）');
   }
   const detail = String(stderr).trim() || (error.message ?? String(error));
   return new ClipboardError(`windows clipboard: ${detail.slice(0, 200)}`);
