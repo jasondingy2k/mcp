@@ -7,19 +7,20 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import OpenAI from 'openai';
-import { readFile, unlink } from 'fs/promises';
+import { statSync } from 'fs';
+import { isAbsolute } from 'path';
 import { makeLogger } from './logging.js';
 import { makeToolError } from './errors.js';
 import {
-  apiKey,
-  baseUrl,
   maxTokens,
-  modelName,
+  primaryProbeTimeoutMs,
+  reasoningEffort,
   ANALYZE_TOTAL_TIMEOUT_MS,
   retryMaxTokens,
+  type ReasoningEffortCapability,
+  type VisionProvider,
 } from './config.js';
 import {
-  validateImagePath,
   validateMagic,
   verifyImage,
   prepareImageForModel,
@@ -27,131 +28,296 @@ import {
   ensureRasterImage,
   parseRegion,
   applyRegion,
+  detectSourceFormat,
+  looksLikeImageBase64,
+  readImageFile,
   type ImageRegion,
 } from './image.js';
+import { PipelineBudget } from './pipeline-budget.js';
+import { removeTempFile } from './temp-manager.js';
 import { extractReasoning } from './reasoning.js';
 import { saveClipboardImage } from './clipboard.js';
 import { saveScreenshotImage } from './screenshot.js';
+import { VISION_SYSTEM_GUARD } from './guards.js';
+import { buildTools, enhanceComparePrompt, enhancePrompt } from './tools.js';
 import {
-  applyFormat,
-  applyLang,
-  buildTools,
-  parseToolJson,
-  PROMPTS,
-  VISION_CAPABILITIES,
-  type VisionCapability,
-  type VisionFormat,
-  type VisionLang,
-} from './tools.js';
+  classifyFailure,
+  isNetworkOrBlockError,
+  isUnsupportedReasoningEffortError,
+  redactKeys,
+  RoundRobin,
+} from './keypool.js';
 
 const SERVER_NAME = 'deepseek-vision';
-const SERVER_VERSION = '0.4.3';
-const FORMAT_SUPPORTED_CAPABILITIES = new Set<VisionCapability>(['describe_ui', 'diagnose_error']);
-const VALID_CAPABILITIES = new Set<string>(VISION_CAPABILITIES);
-type ImageSource = 'clipboard' | 'path' | 'screenshot' | 'base64';
+const SERVER_VERSION = '0.5.0';
 
-const VALID_SOURCES: ImageSource[] = ['clipboard', 'path', 'screenshot', 'base64'];
+type ResolvedImageSource =
+  | { kind: 'clipboard' }
+  | { kind: 'screenshot' }
+  | { kind: 'path'; path: string }
+  | { kind: 'base64'; data: string };
+
 // keyless：有意不以 isError 返回，便于 agent 把设置指引转述给用户（配置提示，非工具执行失败）。
 const KEYLESS_GUIDANCE =
-  'OPENCODE_API_KEY unset. Set OPENCODE_API_KEY (or VISION_API_KEY) in MCP server env.';
+  'OPENCODE_API_KEY unset. Set OPENCODE_API_KEY (or VISION_API_KEY) and/or VISION_FALLBACK_API_KEY. Same pool: comma-separated equal RR; key-scoped errors (auth/429/quota) rotate keys; provider-scoped errors (network/5xx/model/empty) skip to fallback.';
 
 // ---- 静默日志 + 错误前缀 ----
 export const toolError = makeToolError('deepseek-vision');
 export const log = makeLogger('deepseek-vision', 'DEEPSEEK_VISION_LOG_LEVEL');
 
+/** vision 缺省 image → clipboard；解析字面量/路径/base64 */
+export function resolveImageSource(image: string | undefined): ResolvedImageSource {
+  if (image === undefined || image === '') {
+    return { kind: 'clipboard' };
+  }
+  if (typeof image !== 'string') {
+    throw new Error('image must be a string（卡在 图片解析）');
+  }
+  const trimmed = image.trim();
+  if (trimmed === 'clipboard') {
+    return { kind: 'clipboard' };
+  }
+  if (trimmed === 'screenshot') {
+    return { kind: 'screenshot' };
+  }
+  if (looksLikeImageBase64(trimmed)) {
+    return { kind: 'base64', data: trimmed };
+  }
+  if (isAbsolute(trimmed)) {
+    try {
+      const st = statSync(trimmed);
+      if (st.isFile()) {
+        return { kind: 'path', path: trimmed };
+      }
+      throw new Error(`不是一个文件: ${trimmed}（卡在 图片解析）`);
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('（卡在 图片解析）')) throw e;
+      throw new Error(`不是一个文件: ${trimmed}（卡在 图片解析）`);
+    }
+  }
+  throw new Error(
+    `image must be clipboard, screenshot, absolute path, or base64/data URL; got: ${JSON.stringify(image)}（卡在 图片解析）`
+  );
+}
+
 export async function prepareVisionPayload(
   data: Buffer,
-  region?: ImageRegion
+  region?: ImageRegion,
+  budget?: PipelineBudget
 ): Promise<{ mime: string; b64: string }> {
-  data = await ensureRasterImage(data);
+  // HEIC→PNG 会抹掉源格式；须在 ensureRasterImage 前记录，照片仍走 JPEG
+  const sourceFormat = detectSourceFormat(data);
+  data = await ensureRasterImage(data, undefined, budget);
   validateMagic(data);
-  await verifyImage(data);
+  await verifyImage(data, budget);
   if (region !== undefined) {
-    data = await applyRegion(data, region);
+    data = await applyRegion(data, region, budget, sourceFormat);
   }
 
-  const prepared = await prepareImageForModel(data);
+  const prepared = await prepareImageForModel(data, budget, sourceFormat);
   return {
     mime: prepared.mime,
     b64: prepared.buffer.toString('base64'),
   };
 }
 
-async function loadSourceBuffer(
-  source: ImageSource,
-  args: { image_path?: string; image_base64?: string }
+async function loadResolvedBuffer(
+  resolved: ResolvedImageSource,
+  budget?: PipelineBudget
 ): Promise<Buffer> {
-  if (source === 'clipboard') {
-    const path = await saveClipboardImage();
+  budget?.assertRemaining('图片读取', 1_000);
+  if (resolved.kind === 'clipboard') {
+    const path = await saveClipboardImage(budget);
     try {
-      return await readFile(validateImagePath(path));
+      return await readImageFile(path, budget);
     } finally {
-      try {
-        await unlink(path);
-      } catch {
-        /* 忽略 */
-      }
+      await removeTempFile(path);
     }
   }
-  if (source === 'screenshot') {
-    const path = await saveScreenshotImage();
+  if (resolved.kind === 'screenshot') {
+    const path = await saveScreenshotImage(budget);
     try {
-      return await readFile(validateImagePath(path));
+      return await readImageFile(path, budget);
     } finally {
-      try {
-        await unlink(path);
-      } catch {
-        /* 忽略 */
-      }
+      await removeTempFile(path);
     }
   }
-  if (source === 'base64') {
-    return loadImageBufferFromBase64(args.image_base64!);
+  if (resolved.kind === 'base64') {
+    return loadImageBufferFromBase64(resolved.data);
   }
-  return readFile(validateImagePath(args.image_path!));
+  return readImageFile(resolved.path, budget);
 }
 
-function isValidSource(value: unknown): value is ImageSource {
-  return VALID_SOURCES.includes(value as ImageSource);
+type VisionTier = {
+  name: string;
+  model: string;
+  keys: string[];
+  pool: RoundRobin;
+  clients: Map<string, OpenAI>;
+  reasoningEffortCapability: ReasoningEffortCapability;
+  /** auto 模式下端点拒绝 reasoning_effort 后，本池后续请求省略该字段 */
+  omitReasoningEffort: boolean;
+};
+
+function extractMessageContent(msg: unknown): string {
+  const rawContent = (msg as { content?: unknown })?.content;
+  let content = '';
+  if (typeof rawContent === 'string') {
+    content = rawContent;
+  } else if (Array.isArray(rawContent)) {
+    content = rawContent
+      .map((part: unknown) =>
+        part && typeof part === 'object' && 'text' in part
+          ? String((part as { text?: unknown }).text ?? '')
+          : ''
+      )
+      .join('');
+  } else if (rawContent != null) {
+    content = String(rawContent);
+  }
+  return content.trim();
+}
+
+function shouldIncludeReasoningEffort(
+  capability: ReasoningEffortCapability,
+  omitCached: boolean
+): boolean {
+  if (omitCached || capability === 'unsupported') return false;
+  if (capability === 'supported') return reasoningEffort() !== 'none';
+  // auto：none 时省略；否则先发送，遇 unknown field 再窄降级
+  return reasoningEffort() !== 'none';
+}
+
+type ChatMessage =
+  | { role: 'system'; content: string }
+  | { role: 'user'; content: unknown[] };
+
+function buildChatBody(
+  tier: VisionTier,
+  messages: ChatMessage[],
+  tokens: number,
+  omitReasoningEffort: boolean
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: tier.model,
+    messages,
+    temperature: 0.3,
+    max_tokens: tokens,
+  };
+  if (shouldIncludeReasoningEffort(tier.reasoningEffortCapability, omitReasoningEffort)) {
+    body.reasoning_effort = reasoningEffort();
+  }
+  return body;
+}
+
+async function createChatCompletion(
+  client: OpenAI,
+  tier: VisionTier,
+  messages: ChatMessage[],
+  tokens: number,
+  omitReasoningEffort: boolean,
+  attemptTimeout: number
+): Promise<{ response: OpenAI.Chat.Completions.ChatCompletion; omitReasoningEffort: boolean }> {
+  let omit = omitReasoningEffort;
+  for (;;) {
+    try {
+      const body = buildChatBody(tier, messages, tokens, omit);
+      const response = await client.chat.completions.create(body as any, {
+        timeout: attemptTimeout,
+      });
+      return { response, omitReasoningEffort: omit };
+    } catch (e) {
+      if (isUnsupportedReasoningEffortError(e) && !omit) {
+        tier.omitReasoningEffort = true;
+        omit = true;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+/** 视觉推理阶段统一标注：追加「卡在 视觉推理」；已标注则原样返回 */
+function withVisionStage(message: string): string {
+  return message.includes('（卡在 视觉推理）') ? message : `${message}（卡在 视觉推理）`;
+}
+
+/** 远程错误保留原类型与栈，仅补阶段标注（幂等） */
+function annotateVisionStage(err: unknown): unknown {
+  if (err instanceof Error) {
+    err.message = withVisionStage(err.message);
+  }
+  return err;
 }
 
 export class VisionClient {
-  private client: OpenAI;
-  private model: string;
+  private tiers: VisionTier[];
+  private allKeys: string[];
 
-  constructor(apiKeyValue: string, baseURL: string, model: string) {
-    this.model = model;
-    this.client = new OpenAI({
-      apiKey: apiKeyValue,
-      baseURL,
-      // 单请求上限；analyze 另有 ANALYZE_TOTAL_TIMEOUT_MS 总墙钟（含重试）。
-      timeout: ANALYZE_TOTAL_TIMEOUT_MS,
-      // 空 content 已手动重试，关掉 SDK 自动重试避免叠乘。
-      maxRetries: 0,
-    });
+  constructor(providers: VisionProvider[]) {
+    this.tiers = [];
+    this.allKeys = [];
+    for (const p of providers) {
+      if (!p.keys.length) continue;
+      const clients = new Map<string, OpenAI>();
+      for (const key of p.keys) {
+        clients.set(
+          key,
+          new OpenAI({
+            apiKey: key,
+            baseURL: p.baseURL,
+            timeout: ANALYZE_TOTAL_TIMEOUT_MS,
+            maxRetries: 0,
+          })
+        );
+        this.allKeys.push(key);
+      }
+      this.tiers.push({
+        name: p.name,
+        model: p.model,
+        keys: [...p.keys],
+        pool: new RoundRobin(p.keys),
+        clients,
+        reasoningEffortCapability: p.reasoningEffortCapability,
+        omitReasoningEffort: false,
+      });
+    }
+    if (this.tiers.length === 0) {
+      throw new Error('VisionClient requires at least one API key');
+    }
   }
 
-  async analyzeData(data: Buffer, prompt: string, region?: ImageRegion): Promise<string> {
-    const payload = await prepareVisionPayload(data, region);
-    return this.chatWithImages([payload], prompt);
+  async analyzeData(
+    data: Buffer,
+    prompt: string,
+    region?: ImageRegion,
+    budget?: PipelineBudget
+  ): Promise<string> {
+    const b = budget ?? new PipelineBudget();
+    const payload = await prepareVisionPayload(data, region, b);
+    return this.chatWithImages([payload], prompt, b);
   }
 
   async analyzeCompare(
     payloadA: { mime: string; b64: string },
     payloadB: { mime: string; b64: string },
-    prompt: string
+    prompt: string,
+    budget?: PipelineBudget
   ): Promise<string> {
     const text = `Image A is the first image; Image B is the second.\n\n${prompt}`;
-    return this.chatWithImages([payloadA, payloadB], text);
+    const b = budget ?? new PipelineBudget();
+    return this.chatWithImages([payloadA, payloadB], text, b);
   }
 
   private async chatWithImages(
     images: Array<{ mime: string; b64: string }>,
-    prompt: string
+    prompt: string,
+    budget: PipelineBudget
   ): Promise<string> {
-    const messages = [
+    const messages: ChatMessage[] = [
+      { role: 'system', content: VISION_SYSTEM_GUARD },
       {
-        role: 'user' as const,
+        role: 'user',
         content: [
           ...images.map(({ mime, b64 }) => ({
             type: 'image_url' as const,
@@ -162,95 +328,134 @@ export class VisionClient {
       },
     ];
 
-    // 自动重试 1 次：空 content 时 max_tokens 用 retryMaxTokens（不向下钳制）。
-    // 总墙钟 ANALYZE_TOTAL_TIMEOUT_MS，避免 120s×2 静默挂起。
-    const started = Date.now();
     const base = maxTokens();
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const remaining = ANALYZE_TOTAL_TIMEOUT_MS - (Date.now() - started);
-      if (remaining < 3_000) {
-        throw new Error('视觉推理总超时（卡在 视觉推理）');
-      }
-      const tokens = attempt === 0 ? base : retryMaxTokens(base);
-      let response;
-      try {
-        response = await this.client.chat.completions.create(
-          {
-            model: this.model,
-            messages,
-            temperature: 0.3,
-            max_tokens: tokens,
-          },
-          { timeout: remaining }
-        );
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (/timeout|ETIMEDOUT|timed out/i.test(msg) || (e as { name?: string })?.name?.includes('Timeout')) {
-          throw new Error(`视觉推理单次请求超时（卡在 视觉推理）: ${msg.slice(0, 120)}`);
+    const failures: string[] = [];
+
+    // 层级：key-scoped 同池 RR → provider-scoped 整池 skip → 备用池
+    for (let tierIdx = 0; tierIdx < this.tiers.length; tierIdx++) {
+      const tier = this.tiers[tierIdx]!;
+      const hasLaterTier = tierIdx < this.tiers.length - 1;
+      const startKey = tier.pool.next();
+      const keyOrder = tier.pool.orderFrom(startKey);
+      let tierExhausted = false;
+
+      keyLoop: for (const key of keyOrder) {
+        const client = tier.clients.get(key);
+        if (!client) continue;
+
+        let omitReasoningEffort = tier.omitReasoningEffort;
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const remaining = budget.remaining();
+          if (remaining < 3_000) {
+            throw new Error('视觉推理总超时（卡在 视觉推理）');
+          }
+          const attemptTimeout = hasLaterTier
+            ? Math.min(remaining, primaryProbeTimeoutMs())
+            : remaining;
+          const tokens = attempt === 0 ? base : retryMaxTokens(base);
+
+          let response;
+          try {
+            const result = await createChatCompletion(
+              client,
+              tier,
+              messages,
+              tokens,
+              omitReasoningEffort,
+              attemptTimeout
+            );
+            response = result.response;
+            omitReasoningEffort = result.omitReasoningEffort;
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            const redacted = redactKeys(msg.slice(0, 200), this.allKeys);
+            const scope = classifyFailure(e);
+
+            if (scope === 'request') throw annotateVisionStage(e);
+
+            if (isNetworkOrBlockError(e)) {
+              failures.push(`[${tier.name}] network/block: ${redacted}`);
+              if (hasLaterTier) {
+                tierExhausted = true;
+                break keyLoop;
+              }
+              continue keyLoop;
+            }
+
+            if (scope === 'provider') {
+              failures.push(`[${tier.name}] provider: ${redacted}`);
+              tierExhausted = true;
+              break keyLoop;
+            }
+
+            if (scope === 'key') {
+              failures.push(`[${tier.name}] ${redacted}`);
+              continue keyLoop;
+            }
+
+            throw annotateVisionStage(e);
+          }
+
+          if (!response.choices?.length) {
+            failures.push(`[${tier.name}] 模型返回空 choices`);
+            tierExhausted = true;
+            break keyLoop;
+          }
+
+          const msg: any = response.choices[0].message;
+          const content = extractMessageContent(msg);
+          if (content) return content;
+
+          const finishReason = response.choices[0].finish_reason;
+          const reasoning = extractReasoning(msg);
+          const reasoningHint = reasoning ? `；reasoning 前 200 字: ${reasoning.slice(0, 200)}` : '';
+
+          if (attempt === 0) {
+            log(
+              'warn',
+              `模型返回空 content（finish_reason=${finishReason}${reasoningHint}），自动重试一次，max_tokens 加倍为 ${retryMaxTokens(base)}`
+            );
+            continue;
+          }
+
+          failures.push(
+            `[${tier.name}] empty content after retry (finish_reason=${finishReason})${reasoningHint}`
+          );
+          tierExhausted = true;
+          break keyLoop;
         }
-        throw e;
       }
 
-      if (!response.choices?.length) {
-        throw new Error('模型返回空 choices');
-      }
+      if (tierExhausted && hasLaterTier) continue;
 
-      const msg: any = response.choices[0].message;
-      let content = '';
-      const rawContent = msg?.content;
-      if (typeof rawContent === 'string') {
-        content = rawContent;
-      } else if (Array.isArray(rawContent)) {
-        content = rawContent
-          .map((part: any) =>
-            part && typeof part === 'object' && 'text' in part ? String(part.text ?? '') : ''
-          )
-          .join('');
-      } else if (rawContent != null) {
-        content = String(rawContent);
+      if (tierExhausted && !hasLaterTier) {
+        const last = failures[failures.length - 1] ?? '模型未返回正文';
+        if (last.includes('finish_reason=length')) {
+          throw new Error(
+            withVisionStage(
+              `empty content after retry (finish_reason=length). increase VISION_MAX_TOKENS and retry${last.includes('reasoning') ? last.slice(last.indexOf('；')) : ''}`
+            )
+          );
+        }
+        if (last.includes('empty content after retry')) {
+          throw new Error(withVisionStage(last.replace(/^\[[^\]]+\]\s*/, '')));
+        }
+        throw new Error(withVisionStage(last));
       }
-      if (content) return content;
-
-      const finishReason = response.choices[0].finish_reason;
-      const reasoning = extractReasoning(msg);
-      const reasoningHint = reasoning ? `；reasoning 前 200 字: ${reasoning.slice(0, 200)}` : '';
-
-      if (attempt === 0) {
-        log(
-          'warn',
-          `模型返回空 content（finish_reason=${finishReason}${reasoningHint}），自动重试一次，max_tokens 加倍为 ${retryMaxTokens(base)}`
-        );
-        continue;
-      }
-
-      if (finishReason === 'length') {
-        throw new Error(
-          `empty content after retry (finish_reason=length). increase VISION_MAX_TOKENS and retry${reasoningHint}`
-        );
-      }
-      throw new Error(
-        `empty content after retry (finish_reason=${finishReason})${reasoningHint}`
-      );
     }
-    throw new Error('模型未返回正文'); // unreachable
+
+    if (failures.length > 0) {
+      throw new Error(`全部 API key 调用失败（卡在 视觉推理）:\n- ${failures.join('\n- ')}`);
+    }
+    throw new Error('模型未返回正文（卡在 视觉推理）');
   }
 
   async analyze(imagePath: string, prompt: string, region?: ImageRegion): Promise<string> {
-    const p = validateImagePath(imagePath);
-    const data = await readFile(p);
-    return this.analyzeData(data, prompt, region);
+    const budget = new PipelineBudget();
+    const data = await readImageFile(imagePath, budget);
+    return this.analyzeData(data, prompt, region, budget);
   }
-}
-
-function applyFormatPostProcess(
-  text: string,
-  promptKey: string,
-  format?: VisionFormat
-): string {
-  if (format === 'json' && FORMAT_SUPPORTED_CAPABILITIES.has(promptKey as VisionCapability)) {
-    return parseToolJson(text, promptKey as 'diagnose_error' | 'describe_ui');
-  }
-  return text;
 }
 
 function validationError(message: string): {
@@ -263,69 +468,56 @@ function validationError(message: string): {
   };
 }
 
-function resolveCapability(
-  toolName: string,
-  args: Record<string, unknown>
-):
-  | { ok: true; capability: VisionCapability }
-  | { ok: false; response: ReturnType<typeof validationError> } {
-  if (toolName === 'deepseek_vision') {
-    const capability = args.capability;
-    if (capability === undefined || capability === null || capability === '') {
-      return {
-        ok: false,
-        response: validationError('capability is required'),
-      };
-    }
-    if (typeof capability !== 'string' || !VALID_CAPABILITIES.has(capability)) {
-      return {
-        ok: false,
-        response: validationError(
-          `capability must be one of: ${VISION_CAPABILITIES.join(', ')}, got: ${JSON.stringify(capability)}`
-        ),
-      };
-    }
-    return { ok: true, capability: capability as VisionCapability };
+function requireTask(task: unknown): string | { ok: false; response: ReturnType<typeof validationError> } {
+  if (task === undefined || task === null || task === '') {
+    return { ok: false, response: validationError('task is required') };
   }
-
-  return {
-    ok: false,
-    response: validationError(`未知工具: ${toolName}`),
-  };
+  if (typeof task !== 'string') {
+    return {
+      ok: false,
+      response: validationError(`task must be a string, got ${typeof task}`),
+    };
+  }
+  const trimmed = task.trim();
+  if (!trimmed) {
+    return { ok: false, response: validationError('task is required') };
+  }
+  return trimmed;
 }
 
-async function runDeepseekVision(
+function parseImageArg(
+  value: unknown,
+  fieldName: string
+):
+  | { ok: true; value: ResolvedImageSource }
+  | { ok: false; response: ReturnType<typeof validationError> } {
+  if (value === undefined || value === null || value === '') {
+    return {
+      ok: false,
+      response: validationError(`${fieldName} is required`),
+    };
+  }
+  if (typeof value !== 'string') {
+    return {
+      ok: false,
+      response: validationError(`${fieldName} must be a string, got ${typeof value}`),
+    };
+  }
+  try {
+    return { ok: true, value: resolveImageSource(value) };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { ok: false, response: validationError(message) };
+  }
+}
+
+async function runVision(
   client: VisionClient,
-  capability: VisionCapability,
   args: Record<string, unknown>
 ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-  if (args.prompt !== undefined && capability !== 'analyze') {
-    return validationError('prompt is only supported when capability=analyze');
-  }
-
-  let lang: VisionLang | undefined;
-  if (args.lang !== undefined) {
-    if (args.lang !== 'zh' && args.lang !== 'en') {
-      return validationError(
-        `lang must be "zh" or "en", got: ${JSON.stringify(args.lang)}`
-      );
-    }
-    lang = args.lang;
-  }
-
-  let format: VisionFormat | undefined;
-  if (args.format !== undefined) {
-    if (args.format !== 'text' && args.format !== 'json') {
-      return validationError(
-        `format must be "text" or "json", got: ${JSON.stringify(args.format)}`
-      );
-    }
-    if (!FORMAT_SUPPORTED_CAPABILITIES.has(capability)) {
-      return validationError(
-        'format is only supported when capability is describe_ui or diagnose_error'
-      );
-    }
-    format = args.format;
+  const taskResult = requireTask(args.task);
+  if (typeof taskResult !== 'string') {
+    return taskResult.response;
   }
 
   let region: ImageRegion | undefined;
@@ -339,289 +531,50 @@ async function runDeepseekVision(
     }
   }
 
-  const source = args.source;
-  if (!isValidSource(source)) {
-    return validationError(
-      `source must be "clipboard", "path", "screenshot", or "base64", got: ${JSON.stringify(source)}`
-    );
+  if (args.image !== undefined && typeof args.image !== 'string') {
+    return validationError(`image must be a string, got ${typeof args.image}`);
   }
 
-  const promptKey = capability;
-  const override =
-    capability === 'analyze' && typeof args.prompt === 'string' ? args.prompt : undefined;
-
-  let text: string;
-  if (source === 'clipboard') {
-    text = await runClipboard(client, promptKey, override, lang, format, region);
-  } else if (source === 'screenshot') {
-    text = await runScreenshot(client, promptKey, override, lang, format, region);
-  } else if (source === 'base64') {
-    if (!args.image_base64) {
-      return validationError('image_base64 is required when source=base64');
-    }
-    if (typeof args.image_base64 !== 'string') {
-      return validationError(
-        `image_base64 must be a string, got ${typeof args.image_base64}`
-      );
-    }
-    text = await runBase64(
-      client,
-      promptKey,
-      args.image_base64,
-      override,
-      lang,
-      format,
-      region
-    );
-  } else {
-    if (!args.image_path) {
-      return validationError('image_path is required when source=path');
-    }
-    if (typeof args.image_path !== 'string') {
-      return validationError(
-        `image_path must be a string, got ${typeof args.image_path}`
-      );
-    }
-    text = await runImage(
-      client,
-      promptKey,
-      args.image_path,
-      override,
-      lang,
-      format,
-      region
-    );
+  let resolved: ResolvedImageSource;
+  try {
+    resolved = resolveImageSource(args.image as string | undefined);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return validationError(message);
   }
+
+  const prompt = enhancePrompt(taskResult);
+  const budget = new PipelineBudget();
+  const data = await loadResolvedBuffer(resolved, budget);
+  const text = await client.analyzeData(data, prompt, region, budget);
   return { content: [{ type: 'text', text }] };
 }
 
-function buildPrompt(
-  promptKey: string,
-  override?: string,
-  lang?: VisionLang,
-  format?: VisionFormat
-): string {
-  const base = override ?? PROMPTS[promptKey];
-  return applyLang(applyFormat(base, format, promptKey), lang, promptKey, format);
-}
-
-async function runImage(
-  client: VisionClient,
-  promptKey: string,
-  imagePath: string,
-  override?: string,
-  lang?: VisionLang,
-  format?: VisionFormat,
-  region?: ImageRegion
-): Promise<string> {
-  const prompt = buildPrompt(promptKey, override, lang, format);
-  const text = await client.analyze(imagePath, prompt, region);
-  return applyFormatPostProcess(text, promptKey, format);
-}
-
-async function runBase64(
-  client: VisionClient,
-  promptKey: string,
-  imageBase64: string,
-  override?: string,
-  lang?: VisionLang,
-  format?: VisionFormat,
-  region?: ImageRegion
-): Promise<string> {
-  const prompt = buildPrompt(promptKey, override, lang, format);
-  const data = loadImageBufferFromBase64(imageBase64);
-  const text = await client.analyzeData(data, prompt, region);
-  return applyFormatPostProcess(text, promptKey, format);
-}
-
-async function runClipboard(
-  client: VisionClient,
-  promptKey: string,
-  override?: string,
-  lang?: VisionLang,
-  format?: VisionFormat,
-  region?: ImageRegion
-): Promise<string> {
-  const path = await saveClipboardImage();
-  try {
-    return await runImage(client, promptKey, path, override, lang, format, region);
-  } finally {
-    try {
-      await unlink(path); // 用完删除临时文件
-    } catch {
-      /* 忽略 */
-    }
-  }
-}
-
-async function runScreenshot(
-  client: VisionClient,
-  promptKey: string,
-  override?: string,
-  lang?: VisionLang,
-  format?: VisionFormat,
-  region?: ImageRegion
-): Promise<string> {
-  const path = await saveScreenshotImage();
-  try {
-    return await runImage(client, promptKey, path, override, lang, format, region);
-  } finally {
-    try {
-      await unlink(path);
-    } catch {
-      /* 忽略 */
-    }
-  }
-}
-
-async function runCompareImages(
+async function runCompare(
   client: VisionClient,
   args: Record<string, unknown>
 ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
-  if (args.lang !== undefined) {
-    if (args.lang !== 'zh' && args.lang !== 'en') {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: toolError(
-              'ValidationError',
-              `lang must be "zh" or "en", got: ${JSON.stringify(args.lang)}`
-            ),
-          },
-        ],
-        isError: true,
-      };
-    }
-  }
-  const lang = args.lang as VisionLang | undefined;
-
-  let regionA: ImageRegion | undefined;
-  if (args.region_a !== undefined) {
-    try {
-      regionA = parseRegion(args.region_a);
-    } catch (e) {
-      const type = e instanceof Error ? e.name : 'Error';
-      const message = e instanceof Error ? e.message : String(e);
-      return { content: [{ type: 'text', text: toolError(type, message) }], isError: true };
-    }
+  const taskResult = requireTask(args.task);
+  if (typeof taskResult !== 'string') {
+    return taskResult.response;
   }
 
-  let regionB: ImageRegion | undefined;
-  if (args.region_b !== undefined) {
-    try {
-      regionB = parseRegion(args.region_b);
-    } catch (e) {
-      const type = e instanceof Error ? e.name : 'Error';
-      const message = e instanceof Error ? e.message : String(e);
-      return { content: [{ type: 'text', text: toolError(type, message) }], isError: true };
-    }
+  const image1 = parseImageArg(args.image1, 'image1');
+  if (!image1.ok) {
+    return image1.response;
+  }
+  const image2 = parseImageArg(args.image2, 'image2');
+  if (!image2.ok) {
+    return image2.response;
   }
 
-  for (const [field, suffix] of [
-    ['source_a', 'a'],
-    ['source_b', 'b'],
-  ] as const) {
-    const source = args[field];
-    if (!isValidSource(source)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: toolError(
-              'ValidationError',
-              `${field} must be "clipboard", "path", "screenshot", or "base64", got: ${JSON.stringify(source)}`
-            ),
-          },
-        ],
-        isError: true,
-      };
-    }
-    if (source === 'path') {
-      const pathKey = `image_path_${suffix}`;
-      if (!args[pathKey]) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: toolError(
-                'ValidationError',
-                `${pathKey} is required when ${field}=path`
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-      if (typeof args[pathKey] !== 'string') {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: toolError(
-                'ValidationError',
-                `${pathKey} must be a string, got ${typeof args[pathKey]}`
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-    if (source === 'base64') {
-      const b64Key = `image_base64_${suffix}`;
-      if (!args[b64Key]) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: toolError(
-                'ValidationError',
-                `${b64Key} is required when ${field}=base64`
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-      if (typeof args[b64Key] !== 'string') {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: toolError(
-                'ValidationError',
-                `${b64Key} must be a string, got ${typeof args[b64Key]}`
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  }
-
-  const override = typeof args.prompt === 'string' ? args.prompt : undefined;
-  const prompt = applyLang(
-    override ?? PROMPTS.compare,
-    lang,
-    'compare'
-  );
-
-  const sourceA = args.source_a as ImageSource;
-  const sourceB = args.source_b as ImageSource;
-  const dataA = await loadSourceBuffer(sourceA, {
-    image_path: args.image_path_a as string | undefined,
-    image_base64: args.image_base64_a as string | undefined,
-  });
-  const dataB = await loadSourceBuffer(sourceB, {
-    image_path: args.image_path_b as string | undefined,
-    image_base64: args.image_base64_b as string | undefined,
-  });
-
-  const payloadA = await prepareVisionPayload(dataA, regionA);
-  const payloadB = await prepareVisionPayload(dataB, regionB);
-  const text = await client.analyzeCompare(payloadA, payloadB, prompt);
+  const prompt = enhanceComparePrompt(taskResult);
+  const budget = new PipelineBudget();
+  const dataA = await loadResolvedBuffer(image1.value, budget);
+  const payloadA = await prepareVisionPayload(dataA, undefined, budget);
+  const dataB = await loadResolvedBuffer(image2.value, budget);
+  const payloadB = await prepareVisionPayload(dataB, undefined, budget);
+  const text = await client.analyzeCompare(payloadA, payloadB, prompt, budget);
   return { content: [{ type: 'text', text }] };
 }
 
@@ -642,16 +595,14 @@ export function createServer(visionClient: VisionClient | null): Server {
       const args = request.params.arguments ?? {};
       const name: string = request.params.name;
 
-      if (name === 'compare_images') {
-        return await runCompareImages(visionClient, args);
+      if (name === 'vision') {
+        return await runVision(visionClient, args);
+      }
+      if (name === 'compare') {
+        return await runCompare(visionClient, args);
       }
 
-      const resolved = resolveCapability(name, args);
-      if (!resolved.ok) {
-        return resolved.response;
-      }
-
-      return await runDeepseekVision(visionClient, resolved.capability, args);
+      return validationError(`未知工具: ${name}`);
     } catch (e) {
       const type = e instanceof Error ? e.name : 'Error';
       const message = e instanceof Error ? e.message : String(e);

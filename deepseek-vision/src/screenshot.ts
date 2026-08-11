@@ -1,12 +1,16 @@
 // screenshot.ts — 跨平台全屏抓屏（主屏）
 // darwin：screencapture -x；win32：powershell.exe CopyFromScreen；其余平台明确暂不支持。
+// 临时文件仅 workspace-private tmp/（0700），不回退系统 temp。
 import { execFile } from 'child_process';
-import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, resolve } from 'path';
-import { randomUUID } from 'crypto';
-import { fileURLToPath } from 'url';
+import { unlinkSync } from 'fs';
 import { maxImageBytes } from './config.js';
+import type { PipelineBudget } from './pipeline-budget.js';
+import {
+  allocTempPath,
+  assertNonEmptyTempFile,
+  secureExistingTempFile,
+  TempManagerError,
+} from './temp-manager.js';
 
 const SCREENSHOT_TIMEOUT_MS = 15_000;
 
@@ -38,13 +42,13 @@ export function parseDarwinScreenshotError(
   return new ScreenshotError('Screenshot capture failed (screencapture).');
 }
 
-async function execDarwinScreenshot(outPath: string): Promise<void> {
+async function execDarwinScreenshot(outPath: string, timeoutMs: number): Promise<void> {
   const maxBuf = maxImageBytes() + 2 * 1024 * 1024;
   return new Promise<void>((resolvePromise, rejectPromise) => {
     execFile(
       'screencapture',
       ['-x', outPath],
-      { timeout: SCREENSHOT_TIMEOUT_MS, maxBuffer: maxBuf },
+      { timeout: timeoutMs, maxBuffer: maxBuf },
       (error) => {
         const parsed = parseDarwinScreenshotError(error as NodeJS.ErrnoException | null);
         if (parsed) rejectPromise(parsed);
@@ -89,14 +93,14 @@ export function parseWindowsScreenshotError(
   return new ScreenshotError(`windows screenshot: ${detail.slice(0, 200)}`);
 }
 
-async function execWindowsScreenshot(outPath: string): Promise<void> {
+async function execWindowsScreenshot(outPath: string, timeoutMs: number): Promise<void> {
   const script = buildWindowsScreenshotScript(outPath);
   const maxBuf = maxImageBytes() + 2 * 1024 * 1024;
   return new Promise<void>((resolvePromise, rejectPromise) => {
     execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { timeout: SCREENSHOT_TIMEOUT_MS, maxBuffer: maxBuf },
+      { timeout: timeoutMs, maxBuffer: maxBuf },
       (error, _stdout, stderr) => {
         const parsed = parseWindowsScreenshotError(
           error as NodeJS.ErrnoException | null,
@@ -110,45 +114,37 @@ async function execWindowsScreenshot(outPath: string): Promise<void> {
 }
 
 function tempPath(): string {
-  const here = fileURLToPath(import.meta.url);
-  const projectTmp = join(resolve(here, '..', '..'), 'tmp');
-  const candidates = [projectTmp, join(tmpdir(), 'deepseek_vision_mcp')];
-  for (const d of candidates) {
-    try {
-      mkdirSync(d, { recursive: true });
-      return join(d, `shot_${randomUUID()}.png`);
-    } catch {
-      continue;
-    }
-  }
-  throw new ScreenshotError('Cannot create temp directory');
+  return allocTempPath('shot', '.png');
 }
 
 export async function persistScreenshot(
   platform: NodeJS.Platform,
-  execDarwin: (out: string) => Promise<void>,
-  execWin: (out: string) => Promise<void>,
-  makeTempPath: () => string = tempPath
+  execDarwin: (out: string, timeoutMs: number) => Promise<void>,
+  execWin: (out: string, timeoutMs: number) => Promise<void>,
+  makeTempPath: () => string = tempPath,
+  budget?: PipelineBudget
 ): Promise<string> {
   if (platform !== 'darwin' && platform !== 'win32') {
     throw new ScreenshotError(
-      `Screenshot is not supported on this platform (${platform}). Use source=path with an image file.`
+      `Screenshot is not supported on this platform (${platform}). Use an absolute image path or base64/data URL.`
     );
   }
+  const timeoutMs = budget
+    ? budget.stageTimeout('截屏', SCREENSHOT_TIMEOUT_MS, 500)
+    : SCREENSHOT_TIMEOUT_MS;
   const out = makeTempPath();
   try {
-    if (platform === 'darwin') await execDarwin(out);
-    else await execWin(out);
-    if (!existsSync(out) || statSync(out).size <= 0) {
-      throw new ScreenshotError(
+    if (platform === 'darwin') await execDarwin(out, timeoutMs);
+    else await execWin(out, timeoutMs);
+    try {
+      assertNonEmptyTempFile(
+        out,
         'No valid screenshot file (empty or missing)（卡在 截屏）'
       );
+    } catch (e) {
+      throw new ScreenshotError(e instanceof Error ? e.message : String(e));
     }
-    try {
-      chmodSync(out, 0o600);
-    } catch {
-      /* best effort */
-    }
+    secureExistingTempFile(out);
     return out;
   } catch (e) {
     try {
@@ -156,10 +152,19 @@ export async function persistScreenshot(
     } catch {
       /* 清理失败不阻断 */
     }
+    if (e instanceof TempManagerError) {
+      throw new ScreenshotError(e.message);
+    }
     throw e;
   }
 }
 
-export function saveScreenshotImage(): Promise<string> {
-  return persistScreenshot(process.platform, execDarwinScreenshot, execWindowsScreenshot);
+export function saveScreenshotImage(budget?: PipelineBudget): Promise<string> {
+  return persistScreenshot(
+    process.platform,
+    execDarwinScreenshot,
+    execWindowsScreenshot,
+    tempPath,
+    budget
+  );
 }

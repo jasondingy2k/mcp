@@ -1,6 +1,6 @@
 {
   "name": "deepseek-vision",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Clipboard-first vision MCP (OpenCode Go MiMo-V2.5) for DeepSeek-based text-only agents",
   "type": "module",
   "bin": {
@@ -8,6 +8,8 @@
   },
   "scripts": {
     "build": "tsc && node -e \"try{require('fs').chmodSync('build/index.js','755')}catch(e){}\"",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs",
     "watch": "tsc --watch"
   },
   "license": "MIT",
