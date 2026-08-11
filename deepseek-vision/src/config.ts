@@ -178,11 +178,11 @@ export function validateVisionConfig(): string[] {
   if (outFmt && !['auto', 'png', 'jpeg', 'webp'].includes(outFmt.trim().toLowerCase())) {
     errors.push(`VISION_OUTPUT_FORMAT 无效: ${outFmt.trim()}`);
   }
-  const outQ = process.env.VISION_OUTPUT_QUALITY;
-  if (outQ !== undefined && outQ !== '') {
-    const n = Number.parseInt(outQ.trim(), 10);
-    if (!Number.isFinite(n) || n < 1 || n > 100) {
-      errors.push(`VISION_OUTPUT_QUALITY 无效: ${outQ.trim()}`);
+  // 键存在即校验（含纯空白）；须与 tryParseOutputQuality 同一严格语义
+  if (process.env.VISION_OUTPUT_QUALITY !== undefined) {
+    const raw = process.env.VISION_OUTPUT_QUALITY;
+    if (tryParseOutputQuality(raw) === null) {
+      errors.push(`VISION_OUTPUT_QUALITY 无效: ${raw.trim() || '(空)'}`);
     }
   }
 
@@ -293,11 +293,21 @@ export function outputFormat(): VisionOutputFormat {
   return parseOutputFormat(process.env.VISION_OUTPUT_FORMAT);
 }
 
-export function parseOutputQuality(raw: string | undefined): number {
-  if (!raw) return DEFAULT_OUTPUT_QUALITY;
-  const n = Number.parseInt(raw.trim(), 10);
-  if (!Number.isFinite(n) || n < 1 || n > 100) return DEFAULT_OUTPUT_QUALITY;
+/**
+ * 严格解析 JPEG/WebP 质量：完整十进制整数 1..100。
+ * 拒绝尾随字符（`90x`）、小数（`90.5`）、空白、越界；与启动校验共用。
+ */
+export function tryParseOutputQuality(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 100) return null;
   return n;
+}
+
+export function parseOutputQuality(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_OUTPUT_QUALITY;
+  return tryParseOutputQuality(raw) ?? DEFAULT_OUTPUT_QUALITY;
 }
 export function outputQuality(): number {
   return parseOutputQuality(process.env.VISION_OUTPUT_QUALITY);
