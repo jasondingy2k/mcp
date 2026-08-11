@@ -3,11 +3,17 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { pathToFileURL } from 'url';
 import { resolve } from 'path';
-import { apiKey, baseUrl, modelName } from './config.js';
+import { loadVisionProviders, validateVisionConfig } from './config.js';
 import { VisionClient, createServer } from './server.js';
 
-const key = apiKey();
-const visionClient = key ? new VisionClient(key, baseUrl(), modelName()) : null;
+const configErrors = validateVisionConfig();
+if (configErrors.length > 0) {
+  console.error(`[deepseek-vision] Config error: ${configErrors.join('; ')}`);
+  process.exit(1);
+}
+
+const providers = loadVisionProviders();
+const visionClient = providers.length > 0 ? new VisionClient(providers) : null;
 const server = createServer(visionClient);
 
 // 直接运行守卫：测试 import 本模块时不会启动服务器。

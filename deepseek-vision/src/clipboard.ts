@@ -1,13 +1,18 @@
 // clipboard.ts — 跨平台读取剪贴板图片（方案 A 最终形态）
 // darwin：pngpaste（本机实测 pbpaste 读图恒 0 字节，2026-08-07 决策回退）；win32：powershell.exe 单次落盘；
-// 其余平台明确暂不支持。临时文件优先项目 tmp/，回退系统临时目录。
+// 其余平台明确暂不支持。临时文件仅 workspace-private tmp/（0700），不回退系统 temp。
 import { execFile } from 'child_process';
-import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, resolve } from 'path';
-import { randomUUID } from 'crypto';
-import { fileURLToPath } from 'url';
+import { unlinkSync } from 'fs';
 import { maxImageBytes } from './config.js';
+import type { PipelineBudget } from './pipeline-budget.js';
+import {
+  allocTempPath,
+  assertNonEmptyTempFile,
+  secureExistingTempFile,
+  TempManagerError,
+} from './temp-manager.js';
+
+const CLIPBOARD_TIMEOUT_MS = 10_000;
 
 export class ClipboardError extends Error {
   constructor(message: string) {
@@ -38,10 +43,10 @@ export function parseDarwinError(error: NodeJS.ErrnoException | null): Clipboard
   return new ClipboardError('No image in clipboard (pngpaste failed).');
 }
 
-async function execDarwin(outPath: string): Promise<void> {
+async function execDarwin(outPath: string, timeoutMs: number): Promise<void> {
   const maxBuf = maxImageBytes() + 2 * 1024 * 1024;
   return new Promise<void>((resolvePromise, rejectPromise) => {
-    execFile('pngpaste', [outPath], { timeout: 10000, maxBuffer: maxBuf }, (error) => {
+    execFile('pngpaste', [outPath], { timeout: timeoutMs, maxBuffer: maxBuf }, (error) => {
       const parsed = parseDarwinError(error as NodeJS.ErrnoException | null);
       if (parsed) rejectPromise(parsed);
       else resolvePromise();
@@ -87,14 +92,14 @@ export function parseWindowsClipboardError(
 }
 
 // PowerShell 单次落盘到 outPath（不再 Buffer 二次写盘）
-async function execWindowsClipboard(outPath: string): Promise<void> {
+async function execWindowsClipboard(outPath: string, timeoutMs: number): Promise<void> {
   const script = buildWindowsClipboardScript(outPath);
   const maxBuf = maxImageBytes() + 2 * 1024 * 1024;
   return new Promise<void>((resolvePromise, rejectPromise) => {
     execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { timeout: 10000, maxBuffer: maxBuf },
+      { timeout: timeoutMs, maxBuffer: maxBuf },
       (error, _stdout, stderr) => {
         const parsed = parseWindowsClipboardError(
           error as NodeJS.ErrnoException | null,
@@ -109,47 +114,39 @@ async function execWindowsClipboard(outPath: string): Promise<void> {
 
 // ---- 生产入口：平台分流 → 落盘 PNG 临时文件，返回路径；失败清理 ----
 function tempPath(): string {
-  const here = fileURLToPath(import.meta.url);
-  const projectTmp = join(resolve(here, '..', '..'), 'tmp');
-  const candidates = [projectTmp, join(tmpdir(), 'deepseek_vision_mcp')];
-  for (const d of candidates) {
-    try {
-      mkdirSync(d, { recursive: true });
-      return join(d, `clip_${randomUUID()}.png`);
-    } catch {
-      continue;
-    }
-  }
-  throw new ClipboardError('Cannot create temp directory');
+  return allocTempPath('clip', '.png');
 }
 
 // 可注入版（execDarwin / execWin / makeTempPath 便于测试；生产用默认实现）。
 export async function persistClipboard(
   platform: NodeJS.Platform,
-  execDarwin: (out: string) => Promise<void>,
-  execWin: (out: string) => Promise<void>,
-  makeTempPath: () => string = tempPath
+  execDarwin: (out: string, timeoutMs: number) => Promise<void>,
+  execWin: (out: string, timeoutMs: number) => Promise<void>,
+  makeTempPath: () => string = tempPath,
+  budget?: PipelineBudget
 ): Promise<string> {
   // 先判平台再建临时路径，避免 linux 等不支持平台空建 tmp/
   if (platform !== 'darwin' && platform !== 'win32') {
     throw new ClipboardError(
-      `Clipboard image is not supported on this platform (${platform}). Use source=path with an image file.`
+      `Clipboard image is not supported on this platform (${platform}). Use an absolute image path or base64/data URL.`
     );
   }
+  const timeoutMs = budget
+    ? budget.stageTimeout('剪贴板读取', CLIPBOARD_TIMEOUT_MS, 500)
+    : CLIPBOARD_TIMEOUT_MS;
   const out = makeTempPath();
   try {
-    if (platform === 'darwin') await execDarwin(out); // pngpaste 单次落盘
-    else await execWin(out); // PowerShell 单次落盘
-    if (!existsSync(out) || statSync(out).size <= 0) {
-      throw new ClipboardError(
+    if (platform === 'darwin') await execDarwin(out, timeoutMs);
+    else await execWin(out, timeoutMs);
+    try {
+      assertNonEmptyTempFile(
+        out,
         'No valid image file from clipboard (empty or missing)（卡在 剪贴板读取）'
       );
+    } catch (e) {
+      throw new ClipboardError(e instanceof Error ? e.message : String(e));
     }
-    try {
-      chmodSync(out, 0o600);
-    } catch {
-      /* best effort */
-    }
+    secureExistingTempFile(out);
     return out;
   } catch (e) {
     try {
@@ -157,10 +154,13 @@ export async function persistClipboard(
     } catch {
       /* 清理失败不阻断 */
     }
+    if (e instanceof TempManagerError) {
+      throw new ClipboardError(e.message);
+    }
     throw e;
   }
 }
 
-export function saveClipboardImage(): Promise<string> {
-  return persistClipboard(process.platform, execDarwin, execWindowsClipboard);
+export function saveClipboardImage(budget?: PipelineBudget): Promise<string> {
+  return persistClipboard(process.platform, execDarwin, execWindowsClipboard, tempPath, budget);
 }

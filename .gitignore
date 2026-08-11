@@ -51,6 +51,10 @@ tmp/
 **/*.spec.mjs
 **/*.spec.js
 **/*.spec.ts
+# deepseek-vision v0.5：跟踪 runtime 单测（仅忽略 smoke/真实素材，见项目 .gitignore）
+!deepseek-vision/test/
+!deepseek-vision/test/**
+!deepseek-vision/test/*.test.mjs
 
 # --- Local-only: non-runtime extras (do not upload) ---
 **/TOOLMAP.md
