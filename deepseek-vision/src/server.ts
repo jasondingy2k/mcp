@@ -28,6 +28,7 @@ import {
   ensureRasterImage,
   parseRegion,
   applyRegion,
+  detectSourceFormat,
   looksLikeImageBase64,
   readImageFile,
   type ImageRegion,
@@ -104,14 +105,16 @@ export async function prepareVisionPayload(
   region?: ImageRegion,
   budget?: PipelineBudget
 ): Promise<{ mime: string; b64: string }> {
+  // HEIC→PNG 会抹掉源格式；须在 ensureRasterImage 前记录，照片仍走 JPEG
+  const sourceFormat = detectSourceFormat(data);
   data = await ensureRasterImage(data, undefined, budget);
   validateMagic(data);
   await verifyImage(data, budget);
   if (region !== undefined) {
-    data = await applyRegion(data, region, budget);
+    data = await applyRegion(data, region, budget, sourceFormat);
   }
 
-  const prepared = await prepareImageForModel(data, budget);
+  const prepared = await prepareImageForModel(data, budget, sourceFormat);
   return {
     mime: prepared.mime,
     b64: prepared.buffer.toString('base64'),

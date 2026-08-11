@@ -61,6 +61,7 @@ Do not claim inability to see images. Call the tool.
 - `region`: pixels only (`x`, `y`, `width`, `height`); no `unit` or ratio
 - Empty clipboard: try `image: "screenshot"` or an absolute path
 - Linux clipboard/screenshot not supported — use path or base64
+- Payload encoding (server-side): default `VISION_OUTPUT_FORMAT=auto` — photo sources (JPEG/WebP/HEIC) → JPEG q90; PNG/screenshot/alpha → PNG. Bytes≠tokens (tokens follow resolution).
 
 ## Persistent rules (optional)
 

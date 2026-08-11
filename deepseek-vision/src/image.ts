@@ -13,7 +13,10 @@ import {
   maxImageBytes,
   maxImagePixels,
   maxSendEdge,
+  outputFormat,
+  outputQuality,
   verifyImageTimeoutMs,
+  type VisionOutputFormat,
 } from './config.js';
 import type { PipelineBudget } from './pipeline-budget.js';
 import { withSharpConcurrency } from './semaphore.js';
@@ -294,6 +297,78 @@ export function mimeSubtypeFromMagic(data: Buffer): string {
   return 'png';
 }
 
+/** 送模/裁切前记录的源格式（ensureRasterImage 会把 HEIC 抹成 PNG，须提前捕获） */
+export type SourceImageFormat = 'png' | 'jpeg' | 'webp' | 'gif' | 'bmp' | 'heic' | 'unknown';
+export type ResolvedOutputFormat = 'png' | 'jpeg' | 'webp';
+
+export function detectSourceFormat(data: Buffer): SourceImageFormat {
+  const mime = mimeSubtypeFromMagic(data);
+  if (
+    mime === 'png' ||
+    mime === 'jpeg' ||
+    mime === 'webp' ||
+    mime === 'gif' ||
+    mime === 'bmp' ||
+    mime === 'heic'
+  ) {
+    return mime;
+  }
+  return 'unknown';
+}
+
+function isPhotoSource(fmt: SourceImageFormat): boolean {
+  return fmt === 'jpeg' || fmt === 'webp' || fmt === 'heic';
+}
+
+/**
+ * 解析最终编码器：显式 png|jpeg|webp 覆盖；auto 时含 alpha → PNG，
+ * JPEG/WebP/HEIC 照片 → JPEG，其余（截图/PNG/GIF/BMP）→ PNG。
+ */
+export function resolveOutputFormat(
+  sourceFormat: SourceImageFormat,
+  hasAlpha: boolean,
+  mode: VisionOutputFormat = outputFormat()
+): ResolvedOutputFormat {
+  if (mode === 'png' || mode === 'jpeg' || mode === 'webp') return mode;
+  if (hasAlpha) return 'png';
+  if (isPhotoSource(sourceFormat)) return 'jpeg';
+  return 'png';
+}
+
+async function encodePipeline(
+  pipeline: ReturnType<typeof sharp>,
+  format: ResolvedOutputFormat,
+  quality: number
+): Promise<{ buffer: Buffer; mime: string }> {
+  if (format === 'jpeg') {
+    const buffer = await pipeline.jpeg({ quality }).toBuffer();
+    return { buffer, mime: 'jpeg' };
+  }
+  if (format === 'webp') {
+    const buffer = await pipeline.webp({ quality }).toBuffer();
+    return { buffer, mime: 'webp' };
+  }
+  const buffer = await pipeline.png().toBuffer();
+  return { buffer, mime: 'png' };
+}
+
+/** 在已有栅格 buffer 上按源格式/配置重编码（不缩放）；格式已匹配则原样返回 */
+async function maybeReencodeForOutput(
+  data: Buffer,
+  sourceFormat: SourceImageFormat,
+  maxPixels: number
+): Promise<{ buffer: Buffer; mime: string }> {
+  const meta = await sharp(data, { limitInputPixels: maxPixels }).metadata();
+  const hasAlpha = Boolean(meta.hasAlpha);
+  const desired = resolveOutputFormat(sourceFormat, hasAlpha);
+  const current = mimeSubtypeFromMagic(data);
+  if (desired === current) {
+    return { buffer: data, mime: current };
+  }
+  const quality = outputQuality();
+  return encodePipeline(sharp(data, { limitInputPixels: maxPixels }), desired, quality);
+}
+
 async function transcodeHeicWithSips(
   data: Buffer,
   execFileFn: ExecFileLike = execFileAsync,
@@ -394,11 +469,12 @@ export async function verifyImage(data: Buffer, budget?: PipelineBudget): Promis
   });
 }
 
-/** 按 region 裁切当前栅格图（HEIC 转码后、缩图前）；输出 PNG。部分越界 clamp 到图内。 */
+/** 按 region 裁切当前栅格图（HEIC 转码后、缩图前）；按源格式自适应编码。部分越界 clamp 到图内。 */
 export async function applyRegion(
   data: Buffer,
   region: ImageRegion,
-  budget?: PipelineBudget
+  budget?: PipelineBudget,
+  sourceFormat: SourceImageFormat = detectSourceFormat(data)
 ): Promise<Buffer> {
   budget?.assertRemaining('区域裁切', 500);
   const maxPixels = maxImagePixels();
@@ -406,10 +482,12 @@ export async function applyRegion(
   return withTimedSharpStage('区域裁切', budget, verifyImageTimeoutMs(), async () => {
     let imgW: number;
     let imgH: number;
+    let hasAlpha = false;
     try {
       const meta = await sharp(data, { limitInputPixels: maxPixels }).metadata();
       imgW = meta.width ?? 0;
       imgH = meta.height ?? 0;
+      hasAlpha = Boolean(meta.hasAlpha);
       if (imgW <= 0 || imgH <= 0) {
         regionError('无法读取图片宽高');
       }
@@ -439,10 +517,19 @@ export async function applyRegion(
     }
 
     try {
-      return await sharp(data, { limitInputPixels: maxPixels })
-        .extract({ left: clampedLeft, top: clampedTop, width: clampedW, height: clampedH })
-        .png()
-        .toBuffer();
+      const format = resolveOutputFormat(sourceFormat, hasAlpha);
+      const quality = outputQuality();
+      const { buffer } = await encodePipeline(
+        sharp(data, { limitInputPixels: maxPixels }).extract({
+          left: clampedLeft,
+          top: clampedTop,
+          width: clampedW,
+          height: clampedH,
+        }),
+        format,
+        quality
+      );
+      return buffer;
     } catch (e) {
       if (e instanceof ImageValidationError) throw e;
       const msg = e instanceof Error ? e.message : String(e);
@@ -451,25 +538,30 @@ export async function applyRegion(
   });
 }
 
-/** 送模前按最长边缩小；小图不放大、不无谓重编码；edge=0 时原样返回 */
+/** 送模前按最长边缩小；小图不放大；按源格式自适应编码（HEIC 源即使已转 PNG 仍可走 JPEG） */
 export async function prepareImageForModel(
   data: Buffer,
-  budget?: PipelineBudget
+  budget?: PipelineBudget,
+  sourceFormat: SourceImageFormat = detectSourceFormat(data)
 ): Promise<{ buffer: Buffer; mime: string }> {
   budget?.assertRemaining('图片缩放', 500);
   const edge = maxSendEdge();
   if (edge === 0) {
-    return { buffer: data, mime: mimeSubtypeFromMagic(data) };
+    return withTimedSharpStage('图片缩放', budget, verifyImageTimeoutMs(), () =>
+      maybeReencodeForOutput(data, sourceFormat, maxImagePixels())
+    );
   }
 
   return withTimedSharpStage('图片缩放', budget, verifyImageTimeoutMs(), async () => {
     const maxPixels = maxImagePixels();
     let w: number;
     let h: number;
+    let hasAlpha = false;
     try {
       const meta = await sharp(data, { limitInputPixels: maxPixels }).metadata();
       w = meta.width ?? 0;
       h = meta.height ?? 0;
+      hasAlpha = Boolean(meta.hasAlpha);
       if (w <= 0 || h <= 0) {
         throw new ImageValidationError('无法读取图片宽高（卡在 图片缩放）');
       }
@@ -483,15 +575,22 @@ export async function prepareImageForModel(
     }
 
     if (Math.max(w, h) <= edge) {
-      return { buffer: data, mime: mimeSubtypeFromMagic(data) };
+      return maybeReencodeForOutput(data, sourceFormat, maxPixels);
     }
 
     try {
-      const buffer = await sharp(data, { limitInputPixels: maxPixels })
-        .resize({ width: edge, height: edge, fit: 'inside', withoutEnlargement: true })
-        .png()
-        .toBuffer();
-      return { buffer, mime: 'png' };
+      const format = resolveOutputFormat(sourceFormat, hasAlpha);
+      const quality = outputQuality();
+      return await encodePipeline(
+        sharp(data, { limitInputPixels: maxPixels }).resize({
+          width: edge,
+          height: edge,
+          fit: 'inside',
+          withoutEnlargement: true,
+        }),
+        format,
+        quality
+      );
     } catch (e) {
       if (e instanceof ImageValidationError) throw e;
       const msg = e instanceof Error ? e.message : String(e);

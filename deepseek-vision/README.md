@@ -67,6 +67,8 @@ node build/index.js
 | `VISION_MAX_IMAGE_PIXELS` | 像素上限（默认 40_000_000） |
 | `VISION_VERIFY_TIMEOUT_MS` | sharp 解码超时 ms（默认 15000） |
 | `VISION_MAX_SEND_EDGE` | 送模最长边（默认 2048；`0` 禁用） |
+| `VISION_OUTPUT_FORMAT` | 送模编码：`auto`（默认）按源自适应；`png`/`jpeg`/`webp` 强制覆盖。auto：JPEG/WebP/HEIC 照片→JPEG q90；PNG/截图/含 alpha→PNG。WebP 默认不启用 |
+| `VISION_OUTPUT_QUALITY` | JPEG/WebP 质量 1–100（默认 90） |
 | `DEEPSEEK_VISION_LOG_LEVEL` | 日志级别；缺省静默 |
 
 ## 平台能力

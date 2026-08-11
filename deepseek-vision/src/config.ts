@@ -12,6 +12,11 @@ export const DEFAULT_MAX_IMAGE_PIXELS = 40_000_000;
 export const DEFAULT_VERIFY_IMAGE_TIMEOUT_MS = 15_000;
 /** 送模前最长边缩放上限（像素）；0 表示禁用 */
 export const DEFAULT_MAX_SEND_EDGE = 2048;
+/** 送模输出编码：auto=按源格式/alpha 自适应；webp 仅显式启用 */
+export type VisionOutputFormat = 'auto' | 'png' | 'jpeg' | 'webp';
+export const DEFAULT_OUTPUT_FORMAT: VisionOutputFormat = 'auto';
+/** JPEG/WebP 有损质量（1–100）；默认 90（WS-6 基准） */
+export const DEFAULT_OUTPUT_QUALITY = 90;
 /** 单次 analyze（含空 content 重试 + 多池 failover）总墙钟预算 */
 export const ANALYZE_TOTAL_TIMEOUT_MS = 120_000;
 /**
@@ -169,6 +174,18 @@ export function validateVisionConfig(): string[] {
     errors.push(`VISION_REASONING_EFFORT 无效: ${effort}`);
   }
 
+  const outFmt = process.env.VISION_OUTPUT_FORMAT;
+  if (outFmt && !['auto', 'png', 'jpeg', 'webp'].includes(outFmt.trim().toLowerCase())) {
+    errors.push(`VISION_OUTPUT_FORMAT 无效: ${outFmt.trim()}`);
+  }
+  // 键存在即校验（含纯空白）；须与 tryParseOutputQuality 同一严格语义
+  if (process.env.VISION_OUTPUT_QUALITY !== undefined) {
+    const raw = process.env.VISION_OUTPUT_QUALITY;
+    if (tryParseOutputQuality(raw) === null) {
+      errors.push(`VISION_OUTPUT_QUALITY 无效: ${raw.trim() || '(空)'}`);
+    }
+  }
+
   return errors;
 }
 
@@ -264,6 +281,36 @@ export function parseMaxSendEdge(raw: string | undefined): number {
 }
 export function maxSendEdge(): number {
   return parseMaxSendEdge(process.env.VISION_MAX_SEND_EDGE);
+}
+
+export function parseOutputFormat(raw: string | undefined): VisionOutputFormat {
+  if (!raw) return DEFAULT_OUTPUT_FORMAT;
+  const v = raw.trim().toLowerCase();
+  if (v === 'auto' || v === 'png' || v === 'jpeg' || v === 'webp') return v;
+  return DEFAULT_OUTPUT_FORMAT;
+}
+export function outputFormat(): VisionOutputFormat {
+  return parseOutputFormat(process.env.VISION_OUTPUT_FORMAT);
+}
+
+/**
+ * 严格解析 JPEG/WebP 质量：完整十进制整数 1..100。
+ * 拒绝尾随字符（`90x`）、小数（`90.5`）、空白、越界；与启动校验共用。
+ */
+export function tryParseOutputQuality(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 100) return null;
+  return n;
+}
+
+export function parseOutputQuality(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_OUTPUT_QUALITY;
+  return tryParseOutputQuality(raw) ?? DEFAULT_OUTPUT_QUALITY;
+}
+export function outputQuality(): number {
+  return parseOutputQuality(process.env.VISION_OUTPUT_QUALITY);
 }
 
 export function parseSharpConcurrency(raw: string | undefined): number {
